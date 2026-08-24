@@ -33,6 +33,7 @@ class NodeType(Enum):
     
     # === 语句 ===
     CONDITION_STMT = auto()    # 条件语句（若...则...）
+    LOOP_STMT = auto()         # 循环语句（当...执行...）
     ASSIGN_STMT = auto()       # 赋值语句
     INSTRUCTION_STMT = auto()  # 指令语句（道德经助记符）
     OPERATION_STMT = auto()    # 操作语句
@@ -137,6 +138,18 @@ class ConditionStmtNode(ASTNode):
         self.add_child(then_body)
         if else_body:
             self.add_child(else_body)
+
+
+@dataclass
+class LoopStmtNode(ASTNode):
+    """循环语句：当 [条件] 执行 [操作]（while 语义，白箱循环语法）"""
+    def __init__(self, condition: ASTNode, body: ASTNode,
+                 line: int = 1, column: int = 1):
+        super().__init__(NodeType.LOOP_STMT, line, column)
+        self.condition = condition
+        self.body = body
+        self.add_child(condition)
+        self.add_child(body)
 
 
 @dataclass
@@ -273,6 +286,10 @@ class Parser:
         if token.type == TokenType.RUO:
             return self._parse_condition()
         
+        # 当 → 循环语句（白箱循环语法：当 条件 执行 操作）
+        if token.type == TokenType.DANG:
+            return self._parse_loop()
+        
         # 道德经助记符 → 指令语句
         if token.type in self.INSTRUCTION_TOKENS:
             return self._parse_instruction()
@@ -380,6 +397,8 @@ class Parser:
         """解析步骤内容"""
         if self.current_token and self.current_token.type == TokenType.RUO:
             return self._parse_condition()
+        elif self.current_token and self.current_token.type == TokenType.DANG:
+            return self._parse_loop()
         elif self.current_token and self.current_token.type in self.INSTRUCTION_TOKENS:
             return self._parse_instruction()
         elif self.current_token and self.current_token.type == TokenType.IDENTIFIER:
@@ -420,6 +439,23 @@ class Parser:
             else_body = self._parse_statement_or_block()
         
         return ConditionStmtNode(condition, then_body, else_body, start_line, start_col)
+    
+    def _parse_loop(self) -> Optional[ASTNode]:
+        """解析循环语句：当 [条件] 执行 [操作]（while 语义）"""
+        start_line = self.current_token.line if self.current_token else 1
+        start_col = self.current_token.column if self.current_token else 1
+        
+        self._consume(TokenType.DANG, "期望 '当'")
+        
+        condition = self._parse_comparison()
+        
+        self._skip_punctuation_before(TokenType.ZHIXING)
+        
+        self._consume(TokenType.ZHIXING, "期望 '执行'")
+        
+        body = self._parse_statement_or_block()
+        
+        return LoopStmtNode(condition, body, start_line, start_col)
     
     def _skip_punctuation_before(self, *target_types: TokenType):
         """跳过标点符号"""
@@ -640,25 +676,26 @@ class Parser:
         return left
     
     def _parse_expression(self) -> ASTNode:
-        """解析表达式"""
+        """解析表达式（支持二元算术：标识符/数值 + 运算符 + 右操作数）"""
         if self.current_token is None:
             return LiteralNode("", "string")
         
         if self.current_token.type == TokenType.IDENTIFIER:
             # 合并多词短语
-            return self._merge_identifiers()
+            left = self._merge_identifiers()
+            return self._parse_binary_tail(left)
         elif self.current_token.type == TokenType.NUMBER:
             node = LiteralNode(float(self.current_token.value), "number",
                                 self.current_token.line,
                                 self.current_token.column)
             self._advance()
-            return node
+            return self._parse_binary_tail(node)
         elif self.current_token.type == TokenType.STRING:
             node = LiteralNode(self.current_token.value, "string",
                                 self.current_token.line,
                                 self.current_token.column)
             self._advance()
-            return node
+            return self._parse_binary_tail(node)
         else:
             parts = []
             # 停止条件：标点符号 + 语句开头关键字
@@ -677,6 +714,26 @@ class Parser:
                 parts.append(self.current_token.value)
                 self._advance()
             return LiteralNode("".join(parts).strip(), "string")
+    
+    def _parse_binary_tail(self, left: ASTNode) -> ASTNode:
+        """解析二元算术尾部：left [+|-|*|/] right（右结合单级，满足循环体自增语义）"""
+        if self.current_token and self.current_token.type in (
+            TokenType.OP_ADD, TokenType.OP_SUB,
+            TokenType.OP_MUL, TokenType.OP_DIV,
+        ):
+            op_token = self.current_token
+            op_map = {
+                TokenType.OP_ADD: "+", TokenType.OP_SUB: "-",
+                TokenType.OP_MUL: "*", TokenType.OP_DIV: "/",
+            }
+            op = op_map[op_token.type]
+            self._advance()
+            right = self._parse_numeric_value()
+            if right is None:
+                right = self._parse_expression()
+            return BinaryExprNode(left, op, right,
+                                  line=op_token.line, column=op_token.column)
+        return left
     
     # ---- 辅助方法 ----
     

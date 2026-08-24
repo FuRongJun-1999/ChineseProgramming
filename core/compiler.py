@@ -95,6 +95,18 @@ class Compiler:
             self._place(else_lbl)
             self._stmt(s.else_body)
             self._place(end_lbl)
+        elif s.type == NodeType.LOOP_STMT:
+            # 当…执行（while 语义）：条件 → JIF 跳出 → 体 → JUMP 回条件
+            start_lbl = self._new_label()
+            exit_lbl = self._new_label()
+            self._place(start_lbl)
+            self._expr(s.condition)
+            self._emit(Opcode.JUMP_IF_FALSE, exit_lbl)
+            self.pending.append((len(self.code) - 1, exit_lbl))
+            self._stmt(s.body)
+            self._emit(Opcode.JUMP, start_lbl)
+            self.pending.append((len(self.code) - 1, start_lbl))
+            self._place(exit_lbl)
         elif s.type == NodeType.INSTRUCTION_STMT:
             self._instr(s)
         elif s.type == NodeType.ASSIGN_STMT:
@@ -113,7 +125,12 @@ class Compiler:
         if op == TokenType.DAO:
             self._emit(Opcode.DAO, val if val is not None else "无名路径")
         elif op == TokenType.DE:
-            self._emit(Opcode.DE, float(val) if val is not None else 0.0)
+            try:
+                self._emit(Opcode.DE, float(val) if val is not None else 0.0)
+            except (TypeError, ValueError):
+                # 以名举实：非数值操作数（未声明标识符）编译期拦截——名实不符
+                raise SyntaxError(
+                    f"L{s.line} 德 的操作数必须是数值，得到 '{val}'（名实不符）")
         elif op == TokenType.ZIRAN:
             self._emit(Opcode.ZIRAN)
         elif op == TokenType.WUWEI:
@@ -175,12 +192,16 @@ def compile_source(source, strict=True):
         return None, {"ok": False, "errors": errors, "warnings": []}
     # 名实校验（以名举实·静态检查——C2 智能论语义）
     checker = NameChecker()
-    name_errors = checker.check(ast)
+    name_errors, name_warnings = checker.check(ast)
     if strict and name_errors:
         return None, {"ok": False, "errors": name_errors,
-                      "warnings": [], "name_errors": name_errors}
+                      "warnings": name_warnings, "name_errors": name_errors}
     compiler = Compiler()
-    code = compiler.compile(ast)
+    try:
+        code = compiler.compile(ast)
+    except SyntaxError as e:
+        return None, {"ok": False, "errors": [str(e)],
+                      "warnings": [], "name_errors": [str(e)]}
     return code, {"ok": True, "errors": [], "warnings": compiler.warnings}
 
 

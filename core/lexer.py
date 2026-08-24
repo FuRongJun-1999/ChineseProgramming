@@ -61,6 +61,10 @@ class TokenType(Enum):
     DAYU = auto()         # 大于
     XIAOYU = auto()       # 小于
     
+    # === 循环关键字（当…执行：白箱循环语法）===
+    DANG = auto()         # 当
+    ZHIXING = auto()      # 执行
+    
     # === 标识符与常量 ===
     IDENTIFIER = auto()   # 标识符
     NUMBER = auto()        # 数值常量
@@ -77,6 +81,12 @@ class TokenType(Enum):
     QUESTION = auto()     # ？
     EXCLAM = auto()       # ！
     EQUALS = auto()      # = 或 ＝（赋值符号）
+    
+    # === 算术运算符（循环体/表达式需要）===
+    OP_ADD = auto()       # +
+    OP_SUB = auto()       # -
+    OP_MUL = auto()       # *
+    OP_DIV = auto()       # /
 
     # === 特殊 ===
     COMMENT = auto()      # 注释
@@ -117,6 +127,8 @@ KEYWORDS = {
     # 条件/逻辑
     "若", "则", "否则", "于", "为", "不为", "且", "或", "非",
     "等于", "大于", "小于",
+    # 循环（当…执行：白箱循环语法）
+    "当", "执行",
 }
 
 # 关键字 → TokenType
@@ -146,6 +158,8 @@ KEYWORD_MAP = {
     "等于": TokenType.DENGYU,
     "大于": TokenType.DAYU,
     "小于": TokenType.XIAOYU,
+    "当": TokenType.DANG,
+    "执行": TokenType.ZHIXING,
 }
 
 # 按长度降序排列
@@ -163,6 +177,10 @@ PUNCTUATION_MAP = {
     "？": TokenType.QUESTION, "?": TokenType.QUESTION,
     "！": TokenType.EXCLAM, "!": TokenType.EXCLAM,
     "=": TokenType.EQUALS, "＝": TokenType.EQUALS,
+    "+": TokenType.OP_ADD, "＋": TokenType.OP_ADD,
+    "-": TokenType.OP_SUB, "－": TokenType.OP_SUB,
+    "*": TokenType.OP_MUL, "×": TokenType.OP_MUL,
+    "/": TokenType.OP_DIV, "÷": TokenType.OP_DIV,
 }
 
 

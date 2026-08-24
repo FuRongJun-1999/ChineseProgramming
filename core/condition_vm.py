@@ -64,14 +64,19 @@ class ConditionVM:
         self.trace = []                      # 执行轨迹（可解释性）
 
     def run(self, code, trace=False, catch_halt=True, symbols=None,
-            trust=0.0, condition_stack=None):
+            trust=0.0, condition_stack=None, max_steps=100000):
         """执行字节码；code = [(op, arg), ...]
         symbols/trust/condition_stack：初始执行环境（C2 语义：符号表/信任/条件空间）
         catch_halt=True：止(ZHI)/无为(WUWEI) 作为正常控制流信号捕获，
-        返回 {"halt": kind, ...}（VM 自足——停止/让出是语言语义非错误）"""
+        返回 {"halt": kind, ...}（VM 自足——停止/让出是语言语义非错误）
+        max_steps：步数上限防死循环（对齐白箱 VM-循环执行单元：超出报 error）"""
         self.reset(symbols, trust, condition_stack)
         halt = None
+        steps = 0
         while self.ip < len(code):
+            steps += 1
+            if steps > max_steps:
+                raise RecursionError(f"循环未终止（超出步数上限 {max_steps}）")
             op, arg = code[self.ip]
             self.trace.append((self.ip, op, arg))
             self.ip += 1
