@@ -92,5 +92,20 @@ if r5["ok"]:
     st5 = vm5.run(code5)
     check('⑤ 函数定义未调用不执行（直接到止）', st5["halt"] == "halt", '')
 
+# ⑥ 双递归：斐波那契（两次自身调用，调用帧深度嵌套）
+src6 = '''
+定义 斐波那契（n）：若 n 小于 2，则 返回 n，否则 返回 斐波那契（n 减 1）加 斐波那契（n 减 2）；
+结果 = 斐波那契（6）；
+止。
+'''
+code6, r6 = compile_source(src6, strict=False)
+if r6["ok"]:
+    vm6 = ConditionVM()
+    st6 = vm6.run(code6)
+    check('⑥ 双递归斐波那契 fib(6)=8', st6["symbols"].get("结果") == 8.0,
+          f'斐波那契(6)={st6["symbols"].get("结果")}')
+else:
+    check('⑥ 双递归斐波那契 fib(6)=8', False, str(r6["errors"])[:40])
+
 print(f'\n=== 中文函数（定义/调用/递归）测试: {pass_n}/{pass_n + fail_n} 通过 ===')
 sys.exit(0 if fail_n == 0 else 1)
