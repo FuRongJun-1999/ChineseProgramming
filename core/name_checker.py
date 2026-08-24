@@ -23,6 +23,7 @@ from .parser import (
     ASTNode, NodeType, ProgramNode, IdentifierNode, LiteralNode,
     InstructionStmtNode, ConditionStmtNode, ComparisonNode,
     AssignStmtNode, ShuyueNode, StepNode, WenyueNode, DayueNode,
+    LoopStmtNode,
     parse_tokens
 )
 
@@ -488,6 +489,11 @@ class NameChecker:
 
         if stmt.type == NodeType.CONDITION_STMT:
             self._check_condition(stmt)
+        elif stmt.type == NodeType.LOOP_STMT:
+            self._check_loop(stmt)
+        elif stmt.type == NodeType.BLOCK:
+            for s in stmt.statements:
+                self._check_statement(s)
         elif stmt.type == NodeType.INSTRUCTION_STMT:
             self._check_instruction(stmt)
         elif stmt.type == NodeType.SHUYUE:
@@ -537,6 +543,12 @@ class NameChecker:
 
         # 恢复条件空间
         self.current_condition_space = None
+
+    def _check_loop(self, stmt: LoopStmtNode):
+        """检查循环语句（当…执行）：条件表达式 + 循环体"""
+        self._check_expression(stmt.condition)
+        if stmt.body:
+            self._check_statement(stmt.body)
 
     def _count_logical_operands(self, operands: List[ASTNode]) -> int:
         """

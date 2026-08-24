@@ -88,5 +88,35 @@ if r["ok"]:
           exit_addr == jump + 1 and code[jump][1] == 1,
           f'JIF→{exit_addr} JUMP→{code[jump][1]}')
 
+# ⑦ 循环体块（多语句：赋值;若则）+ 嵌套条件（控制流组合）
+src7 = '''
+术曰：
+1。当 计数 小于 3 执行 计数 = 计数 + 1；若 计数 大于 1，则 德 0.1；
+2。止。
+'''
+code7, r7 = compile_source(src7)
+if r7["ok"]:
+    vm7 = ConditionVM()
+    st7 = vm7.run(code7, symbols={'计数': 0})
+    check('⑦ 循环体块+嵌套条件（计数0→3 信任0.2 循环外止）',
+          st7["symbols"].get("计数") == 3.0 and st7["trust"] == 0.2
+          and st7["halt"] == "halt",
+          f'计数={st7["symbols"].get("计数")} trust={st7["trust"]} halt={st7["halt"]}')
+
+# ⑧ 条件体内块（若则多语句）：若 计数 大于 0 则 德 0.1；德 0.1；止
+src8 = '''
+术曰：
+1。若 计数 大于 0，则 德 0.1；德 0.1；
+2。止。
+'''
+code8, r8 = compile_source(src8)
+if r8["ok"]:
+    vm8 = ConditionVM()
+    st8 = vm8.run(code8, symbols={'计数': 1})
+    check('⑧ 条件体内块（then 两条德 0.1×2=0.2）', st8["trust"] == 0.2,
+          f'trust={st8["trust"]}')
+else:
+    check('⑧ 条件体内块（then 两条德 0.1×2=0.2）', False, str(r8["errors"])[:40])
+
 print(f'\n=== 中文循环语法（当…执行）测试: {pass_n}/{pass_n + fail_n} 通过 ===')
 sys.exit(0 if fail_n == 0 else 1)
