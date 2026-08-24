@@ -107,5 +107,20 @@ if r6["ok"]:
 else:
     check('⑥ 双递归斐波那契 fib(6)=8', False, str(r6["errors"])[:40])
 
+# ⑦ 多参数递归：欧几里得 gcd（嵌套若则 × 双参数 × 递归）
+src7 = '''
+定义 最大公约数（甲，乙）：若 甲 等于 乙，则 返回 甲，否则 若 甲 大于 乙，则 返回 最大公约数（甲 减 乙，乙），否则 返回 最大公约数（甲，乙 减 甲）；
+结果 = 最大公约数（48，36）；
+止。
+'''
+code7, r7 = compile_source(src7, strict=False)
+if r7["ok"]:
+    vm7 = ConditionVM()
+    st7 = vm7.run(code7)
+    check('⑦ 多参数递归 gcd(48,36)=12', st7["symbols"].get("结果") == 12.0,
+          f'gcd(48,36)={st7["symbols"].get("结果")}')
+else:
+    check('⑦ 多参数递归 gcd(48,36)=12', False, str(r7["errors"])[:40])
+
 print(f'\n=== 中文函数（定义/调用/递归）测试: {pass_n}/{pass_n + fail_n} 通过 ===')
 sys.exit(0 if fail_n == 0 else 1)
