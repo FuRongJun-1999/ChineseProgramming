@@ -8,6 +8,7 @@ import sys
 import os
 import json
 from pathlib import Path
+from typing import Optional
 
 from core.api import compile_source, validate_source, CompileOptions
 from core.lexer import tokenize
@@ -70,6 +71,27 @@ def create_parser() -> argparse.ArgumentParser:
         "ast", help="解析为 AST 并以 JSON 输出（调试用）"
     )
     ast_parser.add_argument("input", help="输入文件（.proto）")
+    
+    # ---- 原生命令（第六阶段 C3/C4）----
+    pbc_parser = subparsers.add_parser(
+        "compile-pbc", help="原生编译：中文源码 → .pbc 字节码文件（C3，零 Python 运行时依赖）"
+    )
+    pbc_parser.add_argument("input", help="输入文件（.proto）")
+    pbc_parser.add_argument("-o", "--output", default="out.pbc", help="输出 .pbc 文件")
+    
+    run_parser = subparsers.add_parser(
+        "run", help="执行 .pbc 字节码文件（C3 独立运行时）"
+    )
+    run_parser.add_argument("pbc", help=".pbc 文件")
+    run_parser.add_argument("--set", action="append", default=[],
+                            help="初始符号: 名=值（可多次）")
+    
+    debug_parser = subparsers.add_parser(
+        "debug", help="单步调试 .pbc（C4 调试器：逐步可见 ip/信任/条件空间）"
+    )
+    debug_parser.add_argument("pbc", help=".pbc 文件")
+    debug_parser.add_argument("--set", action="append", default=[],
+                              help="初始符号: 名=值（可多次）")
     
     # ---- version ----
     subparsers.add_parser("version", help="显示版本信息")
@@ -302,9 +324,9 @@ def cmd_version() -> int:
 
 
 def _read_input(path: str) -> Optional[str]:
-    """读取输入文件"""
+    """读取输入文件（utf-8-sig：剥离 BOM——真实文件可能带 BOM）"""
     try:
-        return Path(path).read_text(encoding="utf-8")
+        return Path(path).read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         print(f"❌ 文件不存在: {path}")
         return None
@@ -334,11 +356,68 @@ def main():
         return cmd_tokens(args)
     elif args.command == "ast":
         return cmd_ast(args)
+    elif args.command == "compile-pbc":
+        return cmd_compile_pbc(args)
+    elif args.command == "run":
+        return cmd_run(args)
+    elif args.command == "debug":
+        return cmd_debug(args)
     elif args.command == "version":
         return cmd_version()
     else:
         parser.print_help()
         return 0
+
+
+def cmd_compile_pbc(args) -> int:
+    """原生编译：中文源码 → .pbc（C3）"""
+    import os
+    from core.pbc import compile_to_pbc
+    src = _read_input(args.input)
+    if src is None:
+        print(f"错误：无法读取 {args.input}")
+        return 1
+    code, result = compile_to_pbc(src, args.output)
+    if not result["ok"]:
+        for e in result["errors"][:5]:
+            print(f"编译错误: {e}")
+        return 1
+    size = os.path.getsize(args.output) if os.path.exists(args.output) else 0
+    print(f"✔ 原生编译: {args.input} → {args.output}（{len(code)} 条指令，{size} 字节 .pbc）")
+    return 0
+
+
+def cmd_run(args) -> int:
+    """执行 .pbc（C3 独立运行时；--set 注入初始符号）"""
+    from core.pbc import run_pbc
+    symbols = {}
+    for item in args.set:
+        if "=" in item:
+            name, _, val = item.partition("=")
+            symbols[name.strip()] = float(val) if val.strip().replace(".", "", 1).isdigit() else val.strip()
+    state = run_pbc(args.pbc, symbols=symbols)
+    cond = [c["name"] for c in state["condition_space"]]
+    print(f"执行完成: 信任={state['trust']} 符号={state['symbols']} "
+          f"条件空间={cond} 停止={state['halt']}")
+    return 0
+
+
+def cmd_debug(args) -> int:
+    """单步调试 .pbc（C4 调试器；--set 注入初始符号）"""
+    from core.debugger import debug_pbc
+    symbols = {}
+    for item in args.set:
+        if "=" in item:
+            name, _, val = item.partition("=")
+            symbols[name.strip()] = float(val) if val.strip().replace(".", "", 1).isdigit() else val.strip()
+    trace = debug_pbc(args.pbc, symbols=symbols)
+    for snap in trace:
+        cond = [c["name"] for c in snap["cond"]]
+        print(f"  ip={snap['ip']:2d} {snap['op']:12s} 信任={snap['trust']} "
+              f"条件空间={cond} 停止={snap['halt']}")
+    if not trace:
+        print("（无调试轨迹——.pbc 为空或不可执行）")
+    return 0
 
 
 if __name__ == "__main__":
