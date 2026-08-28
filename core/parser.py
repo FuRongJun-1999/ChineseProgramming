@@ -863,6 +863,29 @@ class Parser:
                     CallExprNode(name, args, line, col))
             left = self._merge_identifiers()
             return self._parse_binary_tail(left)
+        elif (self.current_token.type in (TokenType.OP_ADD, TokenType.OP_SUB,
+                                          TokenType.OP_MUL, TokenType.OP_DIV)
+              and self._peek_next() and self._peek_next().type == TokenType.LPAREN):
+            # 运算词作函数名调用（与「定义 加（甲，乙）」定义侧对称）——
+            # 否则落入末尾字符串兜底，静默产出错误字节码（T9-2b 缺陷一）
+            name = self.current_token.value
+            line = self.current_token.line
+            col = self.current_token.column
+            self._advance()
+            self._advance()  # 消费 （
+            args = []
+            while (self.current_token and
+                   self.current_token.type != TokenType.RPAREN and
+                   not self._is_at_end()):
+                if self.current_token.type in (TokenType.IDENTIFIER,
+                                               TokenType.NUMBER):
+                    args.append(self._parse_expression())
+                else:
+                    self._advance()
+            if self.current_token and self.current_token.type == TokenType.RPAREN:
+                self._advance()
+            return self._parse_binary_tail(
+                CallExprNode(name, args, line, col))
         elif self.current_token.type == TokenType.NUMBER:
             node = LiteralNode(float(self.current_token.value), "number",
                                 self.current_token.line,
