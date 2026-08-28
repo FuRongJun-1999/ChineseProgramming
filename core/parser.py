@@ -527,8 +527,11 @@ class Parser:
         
         self._consume(TokenType.DINGYI, "期望 '定义'")
         
-        # 函数名（标识符）
-        if not (self.current_token and self.current_token.type == TokenType.IDENTIFIER):
+        # 函数名（标识符；T11：允许运算词作函数名，与调用侧对称——
+        # 否则「定义 加（甲，乙）」定义头失败，函数体泄漏顶层）
+        _name_types = (TokenType.IDENTIFIER, TokenType.OP_ADD,
+                       TokenType.OP_SUB, TokenType.OP_MUL, TokenType.OP_DIV)
+        if not (self.current_token and self.current_token.type in _name_types):
             self.errors.append("定义后期望函数名")
             return None
         name = self.current_token.value
