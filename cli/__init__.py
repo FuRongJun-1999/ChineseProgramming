@@ -92,7 +92,20 @@ def create_parser() -> argparse.ArgumentParser:
     debug_parser.add_argument("pbc", help=".pbc 文件")
     debug_parser.add_argument("--set", action="append", default=[],
                               help="初始符号: 名=值（可多次）")
-    
+
+    rust_parser = subparsers.add_parser(
+        "rust", help="Rust 原生后端（v0.4 · VM 路线）：中文源码 → cargo 项目 → 构建运行"
+    )
+    rust_parser.add_argument("input", help="输入文件（.proto）")
+    rust_parser.add_argument("-o", "--output", default="out/rust_project",
+                             help="输出 cargo 项目目录")
+    rust_parser.add_argument("--set", action="append", default=[],
+                             help="初始符号: 名=值（可多次）")
+    rust_parser.add_argument("--trust", type=float, default=0.0,
+                             help="初始信任值")
+    rust_parser.add_argument("--no-run", action="store_true",
+                             help="只生成项目不构建运行")
+
     # ---- version ----
     subparsers.add_parser("version", help="显示版本信息")
     
@@ -362,6 +375,8 @@ def main():
         return cmd_run(args)
     elif args.command == "debug":
         return cmd_debug(args)
+    elif args.command == "rust":
+        return cmd_rust(args)
     elif args.command == "version":
         return cmd_version()
     else:
@@ -399,6 +414,40 @@ def cmd_run(args) -> int:
     cond = [c["name"] for c in state["condition_space"]]
     print(f"执行完成: 信任={state['trust']} 符号={state['symbols']} "
           f"条件空间={cond} 停止={state['halt']}")
+    return 0
+
+
+def cmd_rust(args) -> int:
+    """Rust 原生后端（v0.4 · VM 路线）：源码 → cargo 项目 →（可选）构建运行"""
+    import io
+    import json
+    import os
+    import sys
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    from core.rust_codegen import build_and_run, generate_rust_project
+    source = _read_input(args.input)
+    if source is None:
+        print(f"输入文件不存在: {args.input}")
+        return 1
+    gen = generate_rust_project(source, args.output)
+    if not gen["ok"]:
+        print("编译失败:", gen.get("result", {}).get("errors", [])[:3])
+        return 1
+    print(f"✅ 生成 cargo 项目 → {gen['project_dir']} "
+          f"({gen['instructions']} 条指令, {os.path.getsize(gen['pbc'])} 字节 .pbc)")
+    if args.no_run:
+        return 0
+    symbols = {}
+    for item in args.set:
+        if "=" in item:
+            name, _, val = item.partition("=")
+            symbols[name.strip()] = float(val) if val.strip().replace(".", "", 1).isdigit() else val.strip()
+    rr = build_and_run(gen["project_dir"], symbols=symbols, trust=args.trust)
+    if not rr["ok"]:
+        print(f"{'构建' if rr['stage'] == 'build' else '运行'}失败:",
+              rr.get("stderr", "")[-1500:])
+        return 1
+    print("🦀 Rust VM 终态:", json.dumps(rr["state"], ensure_ascii=False))
     return 0
 
 

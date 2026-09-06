@@ -3,7 +3,8 @@ pbc.py · 原生编译产物（第六阶段 C3）：.pbc 字节码文件
 中文源码 → 字节码 → .pbc 文件（序列化）→ 独立 VM 加载执行（零 Python 运行时依赖）
 格式与白箱单元「字节码-序列化/反序列化」一致（白箱自举产物落地项目）。
   [op: len2B+utf8][arg_tag:1B][arg_data...]
-  arg_tag: 0=None, 1=bool, 2=int8B, 3=float8B, 4=str(len2B+utf8), 5=tuple(float8B+int8B)
+  arg_tag: 0=None, 1=bool, 2=int8B, 3=float8B, 4=str(len2B+utf8), 5=tuple(float8B+int8B),
+           6=(int8B + str列表 len2B+各 len2B+utf8)[CALL 签名,v0.4 扩展——向后兼容,旧 tag 不变]
 """
 
 import struct
@@ -37,6 +38,16 @@ def serialize(code):
             out.append(4)
             out.extend(struct.pack("H", len(s)))
             out.extend(s)
+        elif isinstance(arg, tuple) and len(arg) == 2 and isinstance(arg[1], (list, tuple)) \
+                and all(isinstance(x, str) for x in arg[1]):
+            # v0.4 tag6：CALL 签名 (入口 ip:int, 参数名列表 [str...])
+            out.append(6)
+            out.extend(struct.pack("q", arg[0]))
+            out.extend(struct.pack("H", len(arg[1])))
+            for s in arg[1]:
+                sb = s.encode("utf-8")
+                out.extend(struct.pack("H", len(sb)))
+                out.extend(sb)
         elif isinstance(arg, tuple):
             out.append(5)
             out.extend(struct.pack("d", arg[0]))
@@ -77,6 +88,18 @@ def deserialize(data):
             a = struct.unpack_from("q", data, i + 8)[0]
             arg = (t, a)
             i += 16
+        elif tag == 6:
+            entry = struct.unpack_from("q", data, i)[0]
+            i += 8
+            n_params = struct.unpack_from("H", data, i)[0]
+            i += 2
+            params = []
+            for _ in range(n_params):
+                m = struct.unpack_from("H", data, i)[0]
+                i += 2
+                params.append(data[i:i + m].decode("utf-8"))
+                i += m
+            arg = (entry, params)
         else:
             raise ValueError(f"未知标签 {tag}")
         code.append((op, arg))

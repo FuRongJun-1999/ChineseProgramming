@@ -1,0 +1,10 @@
+[package]
+name = "protocol_vm"
+version = "0.1.0"
+edition = "2021"
+
+# 智能论字节码 VM · Rust 原生运行时（零外部依赖——仅 std，对齐项目零依赖哲学）
+# 由 core/rust_codegen.py 生成项目时拷贝；program.pbc 编译期嵌入。
+
+[profile.release]
+opt-level = 3
