@@ -1,0 +1,16 @@
+[package]
+name = "hex_nn"
+version = "0.1.0"
+edition = "2021"
+
+# 白箱原生神经网络 · Rust 性能后端(R1)
+# 语义源:AEIS/aeis/hex_train.py + hex_hier.py(参考实现)
+# 纪律:随机决策(plan)由 Python 预生成——Rust 是确定性执行器;
+#       验收=同计划下 D 曲线与 Python 参考实现逐点对照。
+
+[dependencies]
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = true
