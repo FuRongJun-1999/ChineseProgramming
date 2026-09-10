@@ -329,10 +329,22 @@ def cmd_ast(args) -> int:
 
 def cmd_version() -> int:
     """显示版本信息"""
-    from protocol_compiler import __version__
-    print(f"协议编译器 (protocol-compiler) v{__version__}")
-    print(f"智能论协议框架 v3.1")
-    print(f"支持：中文词法 + 道德经助记符 + 九章算术结构")
+    import importlib.util
+    ver = "unknown"
+    try:
+        # 仓库根目录 __init__.py（包目录名含连字符 "protocol-compiler"，
+        # 无法直接 import，改用文件定位——顺带修复 v0.3 起的 ModuleNotFoundError）
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        spec = importlib.util.spec_from_file_location(
+            "protocol_compiler", os.path.join(root, "__init__.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ver = mod.__version__
+    except Exception as e:  # 版本读取失败不应阻塞 CLI
+        print(f"⚠️ 版本读取失败: {e}")
+    print(f"协议编译器 (protocol-compiler) v{ver}")
+    print(f"智能论协议框架 v3.4")
+    print(f"支持：中文词法 + 道德经助记符 + 九章算术结构 + .pbc 字节码 + Rust 双后端")
     return 0
 
 
