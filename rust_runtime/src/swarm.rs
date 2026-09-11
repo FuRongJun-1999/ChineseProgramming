@@ -287,9 +287,14 @@ struct InstanceProc {
 }
 
 impl InstanceProc {
-    fn spawn(exe: &str, spec: &InstanceSpec) -> Result<Self, String> {
-        let mut child = Command::new(exe)
-            .arg("--serve")
+    fn spawn(exe: &str, spec: &InstanceSpec, pbc_path: Option<&str>) -> Result<Self, String> {
+        let mut cmd = Command::new(exe);
+        cmd.arg("--serve");
+        // 独立形态（未启用 embed）子进程不持有嵌入字节码，须转发 --pbc 路径
+        if let Some(p) = pbc_path {
+            cmd.arg("--pbc").arg(p);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -367,10 +372,20 @@ impl Drop for InstanceProc {
 }
 
 /// 蜂群执行：rounds 轮，每轮各实例执行一次；路由表决定跨实例消息
-pub fn run_swarm(exe: &str, cfg: &SwarmConfig, rounds: u64, wal_path: &str) -> Result<SwarmReport, String> {
+/// 蜂群执行：rounds 轮，每轮各实例执行一次；路由表决定跨实例消息。
+///
+/// `pbc_path`：转发给实例子进程的字节码路径（独立形态必填；
+/// 生成项目形态的子进程自带嵌入字节码，可为 `None`）。
+pub fn run_swarm(
+    exe: &str,
+    cfg: &SwarmConfig,
+    rounds: u64,
+    wal_path: &str,
+    pbc_path: Option<&str>,
+) -> Result<SwarmReport, String> {
     let mut procs: Vec<InstanceProc> = Vec::new();
     for spec in &cfg.instances {
-        procs.push(InstanceProc::spawn(exe, spec)?);
+        procs.push(InstanceProc::spawn(exe, spec, pbc_path)?);
     }
     let mut wal = std::fs::File::create(wal_path)
         .map_err(|e| format!("WAL 创建失败: {e}"))?;

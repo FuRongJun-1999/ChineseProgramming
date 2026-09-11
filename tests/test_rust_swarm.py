@@ -118,5 +118,50 @@ check("跨轮数据只经消息(乙有收件箱,甲无)",
       "已收消息数" in fs["实例乙"]["symbols"]
       and "已收消息数" not in fs["实例甲"]["symbols"])
 
+# ============ ⑤ 独立形态蜂群（--no-default-features + --pbc 转发） ============
+print("=== ⑤ 独立形态蜂群：协调器与子实例 --pbc 转发 ===")
+import shutil
+import subprocess
+from core.pbc import compile_to_pbc
+
+rt_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "rust_runtime")
+if shutil.which("cargo") and os.path.isdir(rt_dir):
+    ind = subprocess.run(["cargo", "build", "--release", "--no-default-features"],
+                         cwd=rt_dir, capture_output=True, text=True, timeout=300,
+                         encoding="utf-8", errors="replace")
+    check("独立形态构建（关闭 embed）", ind.returncode == 0, (ind.stderr or "")[-200:])
+    exe_ind = os.path.join(rt_dir, "target", "release",
+                           "protocol_vm.exe" if os.name == "nt" else "protocol_vm")
+    tmp5 = tempfile.mkdtemp(prefix="swarm_ind_")
+    pbc5 = os.path.join(tmp5, "program.pbc")
+    _, r5 = compile_to_pbc(SOURCE, pbc5)
+    if r5["ok"] and os.path.exists(exe_ind):
+        cfg5 = make_swarm_config(
+            instances=[
+                {"id": "实例甲", "role": "记录", "trust": 0.1, "symbols": {"信任值": 0.5}},
+                {"id": "实例乙", "role": "验证", "trust": 0.2, "symbols": {"信任值": 0.5}},
+            ],
+            routes=[{"from": "实例甲", "event_type": "信任同步", "to": "实例乙",
+                     "payload": "@trust", "level": 0}],
+            rounds=3, shared_secret=SECRET)
+        rr5 = run_swarm(tmp5, cfg5, wal_path="events_ind.jsonl",
+                        pbc_path=pbc5, exe=exe_ind)
+        check("独立形态蜂群运行（子实例收到 --pbc）", rr5["ok"],
+              str(rr5.get("stderr", ""))[:150])
+        if rr5["ok"]:
+            fs5 = rr5["report"]["final_states"]
+            check("独立形态终态与 embed 形态一致(甲 0.9 / 乙 1.0)",
+                  abs(fs5["实例甲"]["trust"] - 0.9) < 1e-9
+                  and abs(fs5["实例乙"]["trust"] - 1.0) < 1e-9,
+                  json.dumps(fs5, ensure_ascii=False)[:120])
+            v5 = verify_wal_signatures(rr5["wal"], SECRET)
+            check(f"独立形态 WAL 全部验签通过({v5['total']} 条)", v5["all_valid"],
+                  f"verified={v5['verified']} bad={v5['bad']}")
+    else:
+        check("独立形态可执行产物存在", False, exe_ind)
+else:
+    check("cargo 不可用 → 跳过独立形态蜂群（环境声明）", True)
+
 print(f"\n{pass_n} passed, {fail_n} failed")
 sys.exit(1 if fail_n else 0)

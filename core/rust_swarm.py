@@ -38,16 +38,27 @@ def make_swarm_config(instances: List[Dict], routes: Optional[List[Dict]] = None
 
 
 def run_swarm(project_dir: str, config: Dict, wal_path: str = "events.jsonl",
-              timeout: int = 120) -> Dict:
-    """写 swarm.json → protocol_vm swarm → 报告解析（含 WAL 路径回传）。"""
+              timeout: int = 120, pbc_path: Optional[str] = None,
+              exe: Optional[str] = None) -> Dict:
+    """写 swarm.json → protocol_vm swarm → 报告解析（含 WAL 路径回传）。
+
+    `exe` / `pbc_path` 供独立形态（`cargo build --release --no-default-features`，
+    未嵌入字节码）使用：协调器须显式 `--pbc`，并由 Rust 侧转发给实例子进程。
+    生成项目形态（默认 `embed`）两者均可省略。
+    """
     cfg_path = os.path.join(project_dir, "swarm.json")
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False)
-    exe = build_rust_exe(project_dir)
+    exe = exe or build_rust_exe(project_dir)
     wal_full = os.path.abspath(os.path.join(project_dir, wal_path))
-    r = subprocess.run([exe, "swarm", "--config", cfg_path, "--wal", wal_full],
+    cmd = [exe, "swarm", "--config", cfg_path, "--wal", wal_full]
+    if pbc_path:
+        cmd += ["--pbc", pbc_path]
+    # Rust 侧输出为 UTF-8（JSON 含中文符号名）——必须显式指定编码：
+    # Windows 默认 GBK 解码会在多字节边界崩溃，导致 stdout 变为 None。
+    r = subprocess.run(cmd,
                        capture_output=True, text=True, timeout=timeout,
-                       cwd=project_dir)
+                       encoding="utf-8", errors="replace", cwd=project_dir)
     if r.returncode != 0:
         return {"ok": False, "stage": "swarm", "stderr": r.stderr[-3000:]}
     try:

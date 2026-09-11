@@ -158,6 +158,13 @@ fn compare(op: &str, a: &Value, b: &Value) -> Result<Value, String> {
     Ok(Value::Bool(r))
 }
 
+/// 默认空环境（等价 [`VM::new`]）——VM 成为库公开 API 后需满足新式惯用法。
+impl Default for VM {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VM {
     pub fn new() -> Self {
         VM {

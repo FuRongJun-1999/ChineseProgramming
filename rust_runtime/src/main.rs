@@ -12,22 +12,25 @@
 //! 输出：终态 JSON（与 Python ConditionVM.run() 返回结构同构）——
 //!   双后端语义等价验收即对照此输出。
 
-mod hmac;
-mod pbc;
-mod serve;
-mod swarm;
-mod vm;
-
 use std::collections::HashMap;
 use std::process::ExitCode;
 
+use protocol_vm::{load_program, pbc, serve, swarm, vm};
 use vm::{Value, VM};
 
-const PROGRAM: &[u8] = include_bytes!("../program.pbc");
+/// 载入并反序列化字节码：显式 `--pbc` 路径优先，其次编译期嵌入。
+fn load_code(pbc_path: Option<&str>) -> Result<Vec<pbc::Instr>, String> {
+    let bytes = load_program(pbc_path)?;
+    pbc::deserialize(&bytes)
+}
 
-fn parse_env(args: &[String]) -> Result<(HashMap<String, Value>, f64), String> {
+/// 单次执行的初始环境：`(符号表, 信任值, 字节码路径)`。
+type Env = (HashMap<String, Value>, f64, Option<String>);
+
+fn parse_env(args: &[String]) -> Result<Env, String> {
     let mut symbols = HashMap::new();
     let mut trust = 0.0f64;
+    let mut pbc_path: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -43,11 +46,27 @@ fn parse_env(args: &[String]) -> Result<(HashMap<String, Value>, f64), String> {
                 let raw = args.get(i).ok_or("--symbols 需 JSON 参数")?;
                 symbols = parse_symbols_json(raw)?;
             }
+            "--pbc" => {
+                i += 1;
+                pbc_path = Some(args.get(i).ok_or("--pbc 需文件路径")?.clone());
+            }
             other => return Err(format!("未知参数 {other}")),
         }
         i += 1;
     }
-    Ok((symbols, trust))
+    Ok((symbols, trust, pbc_path))
+}
+
+/// 取 `--pbc <值>`（不改动 argv；供 `--serve` / `swarm` 分支复用）。
+fn take_pbc(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i + 1 < args.len() {
+        if args[i] == "--pbc" {
+            return Some(args[i + 1].clone());
+        }
+        i += 1;
+    }
+    None
 }
 
 /// 极简 JSON 对象解析（仅支持 {"名": 数值|字符串|true|false|null}——符号表初始环境足够）
@@ -152,10 +171,10 @@ fn main() -> ExitCode {
 
     // ---- 子命令分发：serve / swarm / 默认单次执行 ----
     if args.get(1).map(String::as_str) == Some("--serve") {
-        let code = match pbc::deserialize(PROGRAM) {
+        let code = match load_code(take_pbc(&args).as_deref()) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(".pbc 反序列化失败: {e}");
+                eprintln!(".pbc 载入失败: {e}");
                 return ExitCode::from(2);
             }
         };
@@ -167,17 +186,17 @@ fn main() -> ExitCode {
         return cmd_swarm(&args[2..]);
     }
 
-    let (symbols, trust) = match parse_env(&args) {
+    let (symbols, trust, pbc_path) = match parse_env(&args) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("参数错误: {e}");
             return ExitCode::from(2);
         }
     };
-    let code = match pbc::deserialize(PROGRAM) {
+    let code = match load_code(pbc_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(".pbc 反序列化失败: {e}");
+            eprintln!(".pbc 载入失败: {e}");
             return ExitCode::from(2);
         }
     };
@@ -213,6 +232,7 @@ fn main() -> ExitCode {
 fn cmd_swarm(args: &[String]) -> ExitCode {
     let mut config_path: Option<&String> = None;
     let mut wal_path = String::from("events.jsonl");
+    let mut pbc_path: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -223,6 +243,10 @@ fn cmd_swarm(args: &[String]) -> ExitCode {
             "--wal" => {
                 i += 1;
                 wal_path = args.get(i).cloned().unwrap_or(wal_path);
+            }
+            "--pbc" => {
+                i += 1;
+                pbc_path = args.get(i).cloned();
             }
             other => {
                 eprintln!("swarm 未知参数 {other}");
@@ -327,7 +351,7 @@ fn cmd_swarm(args: &[String]) -> ExitCode {
         instances,
         routes,
     };
-    match swarm::run_swarm(&exe, &cfg, rounds, &wal_path) {
+    match swarm::run_swarm(&exe, &cfg, rounds, &wal_path, pbc_path.as_deref()) {
         Ok(rep) => {
             println!("{}", swarm::report_json(&rep));
             ExitCode::SUCCESS

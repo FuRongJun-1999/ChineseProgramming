@@ -4,7 +4,7 @@
 （与 C3「零 Python 运行时依赖」定位一致），非 AST→Rust 源码直译。
   generate_rust_project(source, out_dir)  中文源码 → cargo 项目（program.pbc 嵌入）
   build_and_run(project_dir)              cargo build + run → 终态 JSON
-产物：out_dir/{Cargo.toml, src/{main,vm,pbc}.rs, program.pbc}
+产物：out_dir/{Cargo.toml, src/{lib,main,vm,pbc,hmac,serve,swarm}.rs, program.pbc}
 runtime 模板：rust_runtime/（纯 std 零依赖，手写 JSON 序列化）。
 """
 from __future__ import annotations
@@ -37,7 +37,8 @@ def generate_rust_project(source: str, out_dir: str, strict: bool = False) -> Di
     # ② 拷贝 runtime 模板（Cargo.toml + src/*.rs）
     for name in ("Cargo.toml",):
         shutil.copy2(os.path.join(RUNTIME_DIR, name), os.path.join(out_dir, name))
-    for name in ("main.rs", "vm.rs", "pbc.rs", "hmac.rs", "serve.rs", "swarm.rs"):
+    for name in ("lib.rs", "main.rs", "vm.rs", "pbc.rs",
+                 "hmac.rs", "serve.rs", "swarm.rs"):
         shutil.copy2(os.path.join(RUNTIME_DIR, "src", name),
                      os.path.join(src_dir, name))
     # ③ 编译元数据（可审计）
@@ -57,7 +58,8 @@ def build_rust_exe(project_dir: str) -> str:
         exe = os.path.join(project_dir, "target", "release", "protocol_vm")
     if not os.path.exists(exe):
         build = subprocess.run(["cargo", "build", "--release"], cwd=project_dir,
-                               capture_output=True, text=True, timeout=180)
+                               capture_output=True, text=True, timeout=180,
+                               encoding="utf-8", errors="replace")
         if build.returncode != 0:
             raise RuntimeError("cargo build 失败: " + build.stderr[-2000:])
     return exe
@@ -69,7 +71,8 @@ def build_and_run(project_dir: str, symbols: Optional[Dict] = None,
     project_dir = os.path.abspath(project_dir)
     build = subprocess.run(
         ["cargo", "build", "--release"], cwd=project_dir,
-        capture_output=True, text=True, timeout=timeout)
+        capture_output=True, text=True, timeout=timeout,
+        encoding="utf-8", errors="replace")
     if build.returncode != 0:
         return {"ok": False, "stage": "build",
                 "stderr": build.stderr[-4000:]}
@@ -81,7 +84,10 @@ def build_and_run(project_dir: str, symbols: Optional[Dict] = None,
         args += ["--trust", repr(trust)]
     if symbols:
         args += ["--symbols", json.dumps(symbols, ensure_ascii=False)]
-    run = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    # Rust 侧输出 UTF-8（JSON 含中文符号名）；不显式指定编码时
+    # Windows 默认 GBK 解码会在多字节边界崩溃 → stdout 变 None。
+    run = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                         encoding="utf-8", errors="replace")
     if run.returncode != 0:
         return {"ok": False, "stage": "run", "stderr": run.stderr[-4000:]}
     try:

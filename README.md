@@ -83,9 +83,9 @@ python -m cli version                                   # 版本信息
 ### 字节码（第六阶段 C3：零 Python 运行时依赖）
 
 ```bash
-python -m cli pbc your_protocol.proto -o out.pbc        # 中文源码 → .pbc 字节码
-python -m cli run out.pbc --set 名=值 --trust 0.5        # Python VM 加载执行
-python -m cli debug out.pbc --set 名=值                  # 字节码单步调试
+python -m cli compile-pbc your_protocol.proto -o out.pbc   # 中文源码 → .pbc 字节码
+python -m cli run   out.pbc --set 名=值                     # Python VM 加载执行
+python -m cli debug out.pbc --set 名=值                     # 字节码单步调试
 ```
 
 ### Rust 后端（v0.4）
@@ -95,32 +95,48 @@ python -m cli rust your_protocol.proto -o out/rust_proj \
     --set 名=值 --trust 0.5 [--no-run]
 ```
 
-生成一个自包含 cargo 项目：`Cargo.toml + src/{main,vm,pbc,hmac,serve,swarm}.rs + program.pbc`
+生成一个自包含 cargo 项目：`Cargo.toml + src/{lib,main,vm,pbc,hmac,serve,swarm}.rs + program.pbc`
 （`.pbc` 以 `include_bytes!` 编译期嵌入）+ `build_meta.json` 编译元数据（可审计）。
 
 > **前置要求**：仅 Rust 后端需要 [Rust 工具链](https://rustup.rs/)（`cargo`）。
-> 不装 Rust 时，纯 Python 路径（compile / pbc / run / debug）**完全可用**——
+> 不装 Rust 时，纯 Python 路径（compile / compile-pbc / run / debug）**完全可用**——
 > Rust 是可选的高性能后端，不是运行前提。
+
+#### 独立 / 库形态
+
+`rust_runtime/` 同时是一个**可被依赖的 crate**（`protocol_vm`，lib + bin 双目标）。
+生成项目形态默认启用 `embed` 特性（编译期嵌入字节码，二进制自包含）；
+独立形态关闭它，字节码改由运行期 `--pbc` 给出，**同一二进制可运行任意程序**：
+
+```bash
+cargo build --release --no-default-features --manifest-path rust_runtime/Cargo.toml
+rust_runtime/target/release/protocol_vm --pbc out.pbc --trust 0.5
+```
+
+`--pbc` 对生成项目形态的二进制同样有效（覆盖嵌入字节码）；`swarm` 子命令接受 `--pbc`
+并转发给实例子进程。库侧入口见 `protocol_vm::load_program`（路径优先、嵌入兜底）。
 
 ### 作为库使用
 
 ```python
 from core import compile_source, CompileOptions
 
-source = """
-若条件空间为伴侣，则止情感权重于0.15。
-道 新信任路径
-"""
+source = """若条件空间为伴侣，则止情感权重于0.15。
+道 新信任路径"""
 
-result = compile_source(source, CompileOptions(llm_assist=False, strict=False))
-if result["ok"]:
-    print(result["code"])
+result = compile_source(source, CompileOptions(llm_assist=False, strict=True))
+print(result.success, result.token_count, result.statement_count)
+print(result.summary())          # ✅ 编译成功 / Token 数 / 语句数 / 耗时
+if result.success:
+    print(result.code)           # 生成的 Python 兼容代码
 ```
 
 ```python
 from core.rust_codegen import generate_rust_project, build_and_run
-gen = generate_rust_project(source, "out/proj")          # → cargo 项目
-res = build_and_run("out/proj", symbols={"信任值": 0.8}, trust=0.6)
+
+gen = generate_rust_project(source, "out/proj", strict=False)      # → cargo 项目
+res = build_and_run(gen["project_dir"], symbols={"信任值": 0.8}, trust=0.6)
+print(res)   # 终态 JSON，与 Python 侧 run_pbc() 同构
 ```
 
 ## 双后端语义等价（v0.4 验收标准）
@@ -198,13 +214,15 @@ print(diag.connected, diag.overall_status, diag.primary_provider, diag.success_r
 ## 协议源代码示例
 
 ```
+（examples/trust.proto）
+
 问曰：如何验证信任？
 答曰：信任值大于0.7。
 术曰：
 1。道 新信任路径；
-2。若条件空间为伴侣，则止情感权重于0.15；
-3。德 累积信任值；
-4。自然 恢复默认。
+2。德 0.3；
+3。若 信任值 大于 0.2，则 德 0.5；
+4。止。
 ```
 
 ## 测试
@@ -218,8 +236,8 @@ python tests/test_compiler_c2.py       # 编译器 C2（12）
 python tests/test_c4_tooling.py        # C4 工具链（8）
 python tests/test_func_compile.py      # 函数/递归编译（10）
 python tests/test_loop_compile.py      # 循环编译（11）
-python tests/test_rust_codegen.py      # Rust 双后端等价（13/13）
-python tests/test_rust_swarm.py        # 多进程蜂群（16/16）
+python tests/test_rust_codegen.py      # Rust 双后端等价 + 独立形态（16/16）
+python tests/test_rust_swarm.py        # 多进程蜂群 + 独立形态（20/20）
 ```
 
 ## 当前状态

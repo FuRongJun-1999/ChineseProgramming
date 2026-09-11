@@ -410,7 +410,7 @@ def cmd_compile_pbc(args) -> int:
             print(f"编译错误: {e}")
         return 1
     size = os.path.getsize(args.output) if os.path.exists(args.output) else 0
-    print(f"✔ 原生编译: {args.input} → {args.output}（{len(code)} 条指令，{size} 字节 .pbc）")
+    print(f"√ 原生编译: {args.input} → {args.output}（{len(code)} 条指令，{size} 字节 .pbc）")
     return 0
 
 

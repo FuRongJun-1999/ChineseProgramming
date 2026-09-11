@@ -9,6 +9,10 @@ import time
 import random
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows 控制台默认 GBK：emoji 输出会 UnicodeEncodeError（与 core/rust_codegen.py 同因）
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from core.protocol_prompt import build_system_prompt, get_context_for_task, CORE_PROMPT
 from core.trust_engine import TrustEngine, TrustState, TrustConfig, create_trust_engine
 from core.info_gap_engine import InfoGapEngine, InfoGapState, InfoGapConfig, create_info_gap_engine

@@ -190,5 +190,37 @@ st8 = vm8.run(code8, symbols={"计数": 0})
 check("Python VM 循环基线 计数=3 信任=0.6",
       st8["symbols"].get("计数") == 3 and st8["trust"] == 0.6)
 
+# ============ ⑨ 独立/库形态（--no-default-features + 运行期 --pbc） ============
+print("=== ⑨ 独立形态：--no-default-features ===")
+if has_cargo and os.path.isdir(rt_dir):
+    ind = subprocess.run(["cargo", "build", "--release", "--no-default-features"],
+                         cwd=rt_dir, capture_output=True, text=True, timeout=300,
+                         encoding="utf-8", errors="replace")
+    check("独立形态构建（关闭 embed）", ind.returncode == 0, (ind.stderr or "")[-200:])
+    exe9 = os.path.join(rt_dir, "target", "release",
+                        "protocol_vm.exe" if os.name == "nt" else "protocol_vm")
+    tmp9 = tempfile.mkdtemp(prefix="pbc_ind_")
+    pbc9 = os.path.join(tmp9, "trust.pbc")
+    _, r9 = compile_to_pbc(old_src, pbc9)
+    if r9["ok"] and os.path.exists(exe9):
+        py9 = run_pbc(pbc9, symbols={"信任值": 0.5})
+        run9 = subprocess.run(
+            [exe9, "--pbc", pbc9, "--symbols",
+             json.dumps({"信任值": 0.5}, ensure_ascii=False)],
+            capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace")
+        rs9 = json.loads(run9.stdout) if run9.returncode == 0 and run9.stdout else {}
+        check("独立形态双后端语义等价", bool(rs9) and state_equiv(py9, rs9),
+              f"exit={run9.returncode} {(run9.stderr or '')[-160:]}")
+        # 独立形态不持有嵌入字节码：缺 --pbc 须引导性报错退出，而非 panic
+        no9 = subprocess.run([exe9], capture_output=True, text=True, timeout=60,
+                             encoding="utf-8", errors="replace")
+        check("独立形态缺 --pbc 时报错退出(2)", no9.returncode == 2,
+              f"exit={no9.returncode}")
+    else:
+        check("独立形态可执行产物存在", False, exe9)
+else:
+    check("cargo 不可用 → 跳过独立形态（环境声明）", True)
+
 print(f"\n{pass_n} passed, {fail_n} failed")
 sys.exit(1 if fail_n else 0)

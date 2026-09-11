@@ -8,6 +8,10 @@ import os
 import json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows 控制台默认 GBK：emoji 输出会 UnicodeEncodeError（与 core/rust_codegen.py 同因）
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from core.api import compile_source, validate_source, CompileOptions
 from core.lexer import tokenize
 from core.parser import parse_tokens
