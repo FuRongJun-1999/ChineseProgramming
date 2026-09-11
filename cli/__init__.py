@@ -362,6 +362,10 @@ def _read_input(path: str) -> Optional[str]:
 
 def main():
     """CLI 主入口"""
+    # Windows 控制台默认 GBK：输出中的 emoji（✅❌⚠️📖…）会触发 UnicodeEncodeError。
+    # 保留控制台原编码（中文仍正确渲染），仅把不可编码字符降级为 '?'。
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     parser = create_parser()
     args = parser.parse_args()
     
