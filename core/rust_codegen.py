@@ -38,7 +38,7 @@ def generate_rust_project(source: str, out_dir: str, strict: bool = False) -> Di
     for name in ("Cargo.toml",):
         shutil.copy2(os.path.join(RUNTIME_DIR, name), os.path.join(out_dir, name))
     for name in ("lib.rs", "main.rs", "vm.rs", "pbc.rs",
-                 "hmac.rs", "serve.rs", "swarm.rs"):
+                 "hmac.rs", "serve.rs", "swarm.rs", "health.rs"):
         shutil.copy2(os.path.join(RUNTIME_DIR, "src", name),
                      os.path.join(src_dir, name))
     # ③ 编译元数据（可审计）

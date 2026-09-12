@@ -18,6 +18,7 @@
 //! ```
 
 pub mod hmac;
+pub mod health;
 pub mod pbc;
 pub mod serve;
 pub mod swarm;

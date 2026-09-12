@@ -14,6 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::hmac::{hmac_sha256, hex32};
+use crate::health::{score_instance, HealthReport, HealthWeights};
 
 /// 延迟分级（对齐 event_bus.py DELIVERY-V1）——V0 仅作 WAL 元数据标记，
 /// 投递间隔调度为后续版本（荣小步实验纪律：先同步路由）
@@ -55,6 +56,24 @@ pub struct SwarmConfig {
     /// 第一版语义：实例 r 轮终态后，按路由表把指定符号载荷广播给目标实例 r+1 轮。
     /// payload_json 里可用 "@trust" 占位（运行时替换为源实例终态信任值）。
     pub routes: Vec<Route>,
+    /// G4a 拓扑："" = 未指定（角色保持用户声明，向后兼容）；
+    /// "mesh" = 全 peer；"hierarchical" = 首实例 queen 其余 worker；
+    /// "centralized" = 首实例 coordinator 其余 worker（对照 A3 ruflo determineRole）
+    pub topology: String,
+}
+
+/// G4a 角色推导（对照 ruflo topology-manager.ts:311-330）。
+/// `index` 为实例在配置中的序位；`requested` 为用户声明角色。
+pub fn derive_role(topology: &str, index: usize, requested: &str) -> Result<String, String> {
+    match topology {
+        "" => Ok(requested.to_string()), // 未指定拓扑：保持用户声明（向后兼容）
+        "mesh" => Ok("peer".to_string()),
+        "hierarchical" => Ok(if index == 0 { "queen" } else { "worker" }.to_string()),
+        "centralized" => Ok(if index == 0 { "coordinator" } else { "worker" }.to_string()),
+        other => Err(format!(
+            "未知拓扑 {other}（支持 mesh/hierarchical/centralized 或缺省）"
+        )),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +94,31 @@ pub struct SwarmReport {
     pub t_variance: f64,
     pub t_alignment: f64,
     pub final_states: HashMap<String, serde_json_like::Value>,
+    /// G3a：实例健康四因子评分（甲案裁定 2026-09-13）
+    pub health: HealthReport,
+    /// G3b：gossip 水位记账（实例 → 实际收到的 gossip 消息数）
+    pub gossip_received: HashMap<String, usize>,
+    /// G3b：gossip 对账一致（每个 gossip 目标都足额收到）
+    pub gossip_consistent: bool,
+    /// G4a：生效拓扑（"" = 未指定）
+    pub topology: String,
+    /// G4a：实例角色表（拓扑推导后）
+    pub roles: HashMap<String, String>,
+    /// G4b：实例消费水位（最后 ACK 的收件箱消息全局 seq）
+    pub watermarks: HashMap<String, u64>,
+    /// G4b：全局已分配消息 seq
+    pub global_seq: u64,
 }
+
+/// gossip 广播保留目标名：Route.to_id = GOSSIP_TARGET 时 fan-out 至除源外全部实例
+pub const GOSSIP_TARGET: &str = "*";
+
+/// G4b 收件箱：轮次 → 目标实例 → 来源 → (载荷, 投递时全局 seq)
+type Inboxes = HashMap<u64, HashMap<String, HashMap<String, (String, u64)>>>;
+
+/// G5 单实例单轮结果：Some(Ok)=终态+是否有收件箱+消费 seq；Some(Err)=重试仍败；
+/// None=死亡实例缺失轮
+type RoundOutcome = Option<Result<(serde_json_like::Value, bool, u64), String>>;
 
 /// 极简 JSON（与 serve.rs serde_like 同源实现——单文件内聚）
 pub mod serde_json_like {
@@ -280,6 +323,122 @@ fn sign_event(key: &str, ev: &Event) -> String {
     hex32(&hmac_sha256(key.as_bytes(), msg.as_bytes()))
 }
 
+/// 轮末快照行的事件类型（B1 断点恢复）。复用 Event 行格式与签名约定，
+/// Python verify_wal_signatures 按类型跳过计数但仍验签。
+pub const SNAPSHOT_TYPE: &str = "__snapshot__";
+
+/// 从 WAL 原始行文本切片 payload 原文（与 Python verify 同法：payload 是内嵌
+/// JSON，签名与收件箱重建都必须用原文，parse→stringify 会丢浮点/键序保真）。
+fn slice_raw_payload(line: &str) -> Option<String> {
+    let marker = "\"payload\":";
+    let pos = line.find(marker)? + marker.len();
+    let raw = &line[pos..];
+    let raw = raw.strip_suffix('}').unwrap_or(raw);
+    Some(raw.to_string())
+}
+
+/// WAL 重放结果（B1）：恢复所需的全部内存状态。
+struct WalReplay {
+    /// 已完成轮数（最后一个快照行的轮号）；None=无快照（不可恢复，从轮 1 重跑）
+    completed: Option<u64>,
+    events: Vec<Event>,
+    acks: HashSet<String>,
+    inboxes: Inboxes,
+    last_trust: HashMap<String, f64>,
+    last_states: HashMap<String, serde_json_like::Value>,
+    /// 验签通过的前缀行原文（恢复续跑前据此截断坏尾）
+    kept_lines: Vec<String>,
+    /// G4b：重放的路由事件计数（恢复后 global_seq 起点，保持单调）
+    replayed_seq: u64,
+}
+
+/// 重放 WAL 重建状态（对照 langgraph 恢复语义：重建后走正常循环，无特殊路径）。
+/// 完整性守卫：任何行 parse 失败或验签失败 → 停在该行（截断点），其前的行可信。
+fn replay_wal(wal_path: &str, secret: &str) -> Result<WalReplay, String> {
+    let mut rp = WalReplay {
+        completed: None,
+        events: Vec::new(),
+        acks: HashSet::new(),
+        inboxes: HashMap::new(),
+        last_trust: HashMap::new(),
+        last_states: HashMap::new(),
+        kept_lines: Vec::new(),
+        replayed_seq: 0,
+    };
+    let raw = match std::fs::read_to_string(wal_path) {
+        Ok(r) => r,
+        Err(_) => return Ok(rp), // 无 WAL = 首跑
+    };
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(raw_payload) = slice_raw_payload(line) else {
+            break; // 半行（崩溃残留）→ 截断点
+        };
+        let Ok(v) = serde_json_like::parse(line) else {
+            break;
+        };
+        let get_s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let ev = Event {
+            ts: v.get("ts").and_then(|x| x.as_f64()).unwrap_or(0.0) as u64,
+            from_id: get_s("from"),
+            to_id: get_s("to"),
+            event_type: get_s("type"),
+            payload_json: raw_payload.clone(),
+            round_no: v.get("round").and_then(|x| x.as_f64()).unwrap_or(0.0) as u64,
+            level: v.get("level").and_then(|x| x.as_f64()).unwrap_or(0.0) as u8,
+            hmac_hex: get_s("hmac"),
+        };
+        // HMAC 完整性守卫：尾部篡改/残缺即截断
+        if sign_event(secret, &ev) != ev.hmac_hex {
+            break;
+        }
+        // 快照提交点语义（B1 回滚规则）：快照轮之后的轮次未获持久化承诺，
+        // 整轮回滚重跑——WAL 是顺序日志，第一个超前轮的行即截断点（保持前缀性）。
+        // 这防止「kill 落在事件已写、快照未写之间」时重放+重跑造成事件重复。
+        if let Some(c) = rp.completed {
+            if ev.round_no > c {
+                break;
+            }
+        }
+        if ev.event_type == SNAPSHOT_TYPE {
+            // 快照行：重建信任水位与终态；payload = {"trusts":{..},"states":{..}}
+            if let Ok(p) = serde_json_like::parse(&raw_payload) {
+                rp.completed = Some(ev.round_no);
+                if let Some(serde_json_like::Value::Obj(trusts)) = p.get("trusts") {
+                    for (id, t) in trusts {
+                        if let Some(f) = t.as_f64() {
+                            rp.last_trust.insert(id.clone(), f.clamp(0.0, 1.0));
+                        }
+                    }
+                }
+                if let Some(serde_json_like::Value::Obj(states)) = p.get("states") {
+                    rp.last_states = states.clone();
+                }
+            }
+        } else {
+            if ev.event_type == "ACK" {
+                rp.acks.insert(ev.hmac_hex.clone());
+            } else if ev.to_id != "协调器" {
+                // 路由事件：round 产生 → round+1 收件箱（与在线写入语义一致）。
+                // G4b：重放计数保持 seq 全局单调（恢复后水位不断档）
+                rp.replayed_seq += 1;
+                rp.inboxes
+                    .entry(ev.round_no + 1)
+                    .or_default()
+                    .entry(ev.to_id.clone())
+                    .or_default()
+                    .insert(ev.from_id.clone(), (raw_payload, rp.replayed_seq));
+            }
+        }
+        rp.events.push(ev);
+        rp.kept_lines.push(line.to_string());
+    }
+    Ok(rp)
+}
+
 struct InstanceProc {
     spec: InstanceSpec,
     child: Child,
@@ -383,28 +542,172 @@ pub fn run_swarm(
     wal_path: &str,
     pbc_path: Option<&str>,
 ) -> Result<SwarmReport, String> {
+    // G4a：拓扑角色推导（显式声明 role 仅在未指定拓扑时保留——向后兼容）。
+    // 推导后的实例表供 spawn 与聚合使用；参数 cfg 保持不可变引用。
+    let mut specs_derived: Vec<InstanceSpec> = cfg.instances.clone();
+    for (i, spec) in specs_derived.iter_mut().enumerate() {
+        spec.role = derive_role(&cfg.topology, i, &spec.role)?;
+    }
+
+    // B1 断点恢复：先重放 WAL。有快照 → 从快照轮+1 续跑（append）；
+    // 无快照 → 维持旧行为从轮 1 截断重跑；坏尾（半行/篡改）在重放处停住。
+    let replay = replay_wal(wal_path, &cfg.shared_secret)?;
+    let mut all_events: Vec<Event> = replay.events;
+    let mut acks: HashSet<String> = replay.acks;
+    let mut inboxes: Inboxes = replay.inboxes;
+    let mut last_states: HashMap<String, serde_json_like::Value> = replay.last_states;
+    let mut last_trust: HashMap<String, f64> = replay.last_trust;
+    let start_round = replay.completed.map_or(1, |k| k + 1);
+    // G3a：每实例轮次终态序列（在线窗口 = 本次执行的轮次），供健康评分
+    let mut round_outcomes: HashMap<String, Vec<Option<bool>>> = HashMap::new();
+    // G3b：gossip 水位记账（实例 → 实收 gossip 消息数）
+    let mut gossip_sent: HashMap<String, usize> = HashMap::new();
+    // G4b：全局消息 seq（单调）与实例消费水位
+    let mut global_seq: u64 = replay.replayed_seq;
+    let mut watermarks: HashMap<String, u64> = HashMap::new();
+    // G5：死亡实例集合（重试仍失败 → 退场，蜂群继续）
+    let mut dead: HashSet<String> = HashSet::new();
+
+    if replay.completed.is_some() && start_round > rounds {
+        // 目标轮数已全部持久化完成：不重启实例直接聚合（恢复幂等口径）。
+        // 本会话无在线执行窗口 → round_outcomes 空 → health 为空对象。
+        return Ok(aggregate_report(
+            cfg,
+            specs_derived,
+            rounds,
+            all_events,
+            acks,
+            last_states,
+            HashMap::new(),
+            gossip_sent,
+            watermarks,
+            global_seq,
+        ));
+    }
+
+    let mut wal = if replay.completed.is_some() {
+        // 恢复模式：好行重写（物理截断坏尾）→ append 续跑
+        let mut f =
+            std::fs::File::create(wal_path).map_err(|e| format!("WAL 打开失败: {e}"))?;
+        for line in &replay.kept_lines {
+            f.write_all(line.as_bytes())
+                .map_err(|e| format!("WAL 重写失败: {e}"))?;
+            f.write_all(b"\n").map_err(|e| format!("WAL 重写失败: {e}"))?;
+        }
+        f.flush().map_err(|e| format!("WAL flush 失败: {e}"))?;
+        f.sync_all().map_err(|e| format!("WAL sync 失败: {e}"))?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(wal_path)
+            .map_err(|e| format!("WAL 追加打开失败: {e}"))?
+    } else {
+        std::fs::File::create(wal_path).map_err(|e| format!("WAL 创建失败: {e}"))?
+    };
+
     let mut procs: Vec<InstanceProc> = Vec::new();
-    for spec in &cfg.instances {
+    for spec in &specs_derived {
         procs.push(InstanceProc::spawn(exe, spec, pbc_path)?);
     }
-    let mut wal = std::fs::File::create(wal_path)
-        .map_err(|e| format!("WAL 创建失败: {e}"))?;
-    let mut all_events: Vec<Event> = Vec::new();
-    let mut acks: HashSet<String> = HashSet::new();
-    // 收件箱：round → to_id → {from_id: payload_json}
-    let mut inboxes: HashMap<u64, HashMap<String, HashMap<String, String>>> =
-        HashMap::new();
-    let mut last_states: HashMap<String, serde_json_like::Value> = HashMap::new();
-    let mut last_trust: HashMap<String, f64> = HashMap::new();
 
-    for round in 1..=rounds {
+    for round in start_round..=rounds {
         // 本轮各实例收到的消息（上一轮路由产出）
         let round_inboxes = inboxes.remove(&round).unwrap_or_default();
         let mut new_events: Vec<Event> = Vec::new();
-        for p in procs.iter_mut() {
-            let inbox = round_inboxes.get(&p.spec.id).cloned().unwrap_or_default();
-            let st = p.run_round(round, &inbox)?;
+        // —— B2 超步（BSP compute 阶段）：轮内实例并行执行 ——
+        // 安全性论证：收件箱只来自上一轮路由，轮内实例互不依赖；
+        // 一实例一线程一管道（&mut 独占借用），无共享可变状态。
+        // 屏障 = scope 退出时 join 收齐——收齐前任何写入不进入下一阶段。
+        // G5：死亡实例本轮跳过（outcomes 记 None，uptime 降）；存活实例
+        //     管道断裂时同线程重建进程重跑该轮（轮次号幂等：每轮完整环境）。
+        let round_out: Vec<RoundOutcome> =
+            std::thread::scope(|s| {
+                let handles: Vec<_> = procs
+                    .iter_mut()
+                    .map(|p| {
+                        if dead.contains(&p.spec.id) {
+                            return None;
+                        }
+                        let inbox_raw = round_inboxes
+                            .get(&p.spec.id)
+                            .cloned()
+                            .unwrap_or_default();
+                        let has_inbox = !inbox_raw.is_empty();
+                        let inbox: HashMap<String, String> = inbox_raw
+                            .iter()
+                            .map(|(k, (v, _))| (k.clone(), v.clone()))
+                            .collect();
+                        let max_seq = inbox_raw
+                            .values()
+                            .map(|(_, s)| *s)
+                            .max()
+                            .unwrap_or(0);
+                        Some(s.spawn(move || {
+                            let attempt =
+                                p.run_round(round, &inbox).map(|st| (st, has_inbox, max_seq));
+                            match attempt {
+                                ok @ Ok(_) => ok,
+                                Err(pipe_err) => {
+                                    // G5 容错：管道断裂 → 重建实例进程重试一次。
+                                    // 幂等性：每轮从完整环境起算（符号表不跨轮持久），
+                                    // 重跑同一轮次不产生副作用累积。
+                                    eprintln!(
+                                        "实例 {} 轮 {} 管道异常（{pipe_err}），重建重试",
+                                        p.spec.id, round
+                                    );
+                                    *p = InstanceProc::spawn(exe, &p.spec, pbc_path)?;
+                                    p.run_round(round, &inbox)
+                                        .map(|st| (st, has_inbox, max_seq))
+                                }
+                            }
+                        }))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.map(|j| j.join().unwrap_or_else(|_| Err("实例线程 panic".into())))
+                    })
+                    .collect()
+            });
+        // —— 屏障后（BSP apply 阶段）：按实例声明序处理，确定性保持 ——
+        for (p, out) in procs.iter_mut().zip(round_out) {
+            let out = match out {
+                Some(o) => o,
+                None => {
+                    // G5：死亡实例本轮缺失（uptime 降，不伪造终态）
+                    round_outcomes
+                        .entry(p.spec.id.clone())
+                        .or_default()
+                        .push(None);
+                    continue;
+                }
+            };
+            let (st, had_inbox, inbox_max_seq) = match out {
+                Ok(v) => v,
+                Err(e) => {
+                    // G5：重试仍失败 → 实例死亡退场；信任曲线沿用语义与此对齐
+                    eprintln!("实例 {} 重试仍失败（{e}），标记 dead 退场", p.spec.id);
+                    dead.insert(p.spec.id.clone());
+                    round_outcomes
+                        .entry(p.spec.id.clone())
+                        .or_default()
+                        .push(None);
+                    continue;
+                }
+            };
+            // G4b：水位推进（最后 ACK 的收件箱消息 seq）
+            if had_inbox {
+                let wm = watermarks.entry(p.spec.id.clone()).or_insert(0);
+                if inbox_max_seq > *wm {
+                    *wm = inbox_max_seq;
+                }
+            }
             last_states.insert(p.spec.id.clone(), st.clone());
+            // G3a：记录本轮终态（error 终态对象含 "error" 键 → Some(false)）
+            round_outcomes
+                .entry(p.spec.id.clone())
+                .or_default()
+                .push(Some(!st.get("error").is_some()));
             // 信任提交（防操纵：0-1 夹取；同轮同实例由聚合器去重）。
             // error 终态无 trust 字段 → 沿用上一轮值（实例故障不推平信任曲线）
             let prev_t = last_trust
@@ -418,13 +721,14 @@ pub fn run_swarm(
                 .clamp(0.0, 1.0);
             last_trust.insert(p.spec.id.clone(), t);
             // ACK 事件：实例收到收件箱 → 回执
-            if !inbox.is_empty() {
+            if had_inbox {
                 let ev = Event {
                     ts: now_ms(),
                     from_id: p.spec.id.clone(),
                     to_id: "协调器".into(),
                     event_type: "ACK".into(),
-                    payload_json: format!("{{\"round\":{}}}", round),
+                    // G4b：ACK 携带消费水位（payload 进签名串，自动受 HMAC 保护）
+                    payload_json: format!("{{\"round\":{},\"seq\":{}}}", round, inbox_max_seq),
                     round_no: round,
                     level: 0,
                     hmac_hex: String::new(),
@@ -438,29 +742,46 @@ pub fn run_swarm(
             for r in &cfg.routes {
                 if r.from_id == p.spec.id {
                     let payload = r.payload_json.replace("@trust", &format!("{t}"));
-                    let ev = Event {
-                        ts: now_ms(),
-                        from_id: p.spec.id.clone(),
-                        to_id: r.to_id.clone(),
-                        event_type: r.event_type.clone(),
-                        payload_json: payload.clone(),
-                        round_no: round,
-                        level: r.level,
-                        hmac_hex: String::new(),
+                    // G3b：to_id="*" = gossip 广播（fan-out 至除源外全部实例）
+                    let targets: Vec<String> = if r.to_id == GOSSIP_TARGET {
+                        cfg.instances
+                            .iter()
+                            .map(|s| s.id.clone())
+                            .filter(|id| *id != p.spec.id)
+                            .collect()
+                    } else {
+                        vec![r.to_id.clone()]
                     };
-                    let mut ev = ev;
-                    ev.hmac_hex = sign_event(&cfg.shared_secret, &ev);
-                    let slot = inboxes
-                        .entry(round + 1)
-                        .or_default()
-                        .entry(r.to_id.clone())
-                        .or_default();
-                    slot.insert(p.spec.id.clone(), payload);
-                    new_events.push(ev);
+                    for to_id in targets {
+                        global_seq += 1;
+                        let ev = Event {
+                            ts: now_ms(),
+                            from_id: p.spec.id.clone(),
+                            to_id: to_id.clone(),
+                            event_type: r.event_type.clone(),
+                            payload_json: payload.clone(),
+                            round_no: round,
+                            level: r.level,
+                            hmac_hex: String::new(),
+                        };
+                        let mut ev = ev;
+                        ev.hmac_hex = sign_event(&cfg.shared_secret, &ev);
+                        let slot = inboxes
+                            .entry(round + 1)
+                            .or_default()
+                            .entry(ev.to_id.clone())
+                            .or_default();
+                        slot.insert(p.spec.id.clone(), (payload.clone(), global_seq));
+                        if r.to_id == GOSSIP_TARGET {
+                            *gossip_sent.entry(to_id).or_insert(0) += 1;
+                        }
+                        new_events.push(ev);
+                    }
                 }
             }
         }
-        // WAL 落盘（append-only）
+        // WAL 落盘（append-only）· B1 纪律：事件行先 durable（flush），
+        // 轮末快照后 durable（sync_all）——快照永不先于产生它的写入落盘。
         for ev in &new_events {
             let line = format!(
                 "{{\"ts\":{},\"from\":\"{}\",\"to\":\"{}\",\"type\":\"{}\",\"round\":{},\"level\":{},\"hmac\":\"{}\",\"payload\":{}}}\n",
@@ -476,13 +797,121 @@ pub fn run_swarm(
             wal.write_all(line.as_bytes())
                 .map_err(|e| format!("WAL 写入失败: {e}"))?;
         }
+        wal.flush().map_err(|e| format!("WAL flush 失败: {e}"))?;
+        // 轮末快照行：复用事件行格式与签名约定（Python verify 按类型跳过计数仍验签）。
+        // payload = {"trusts":{...},"states":{...}}——恢复时重建信任水位与终态。
+        let trusts_parts: Vec<String> = {
+            let mut ids: Vec<&String> = cfg.instances.iter().map(|s| &s.id).collect();
+            ids.sort();
+            ids.iter()
+                .filter_map(|id| {
+                    last_trust
+                        .get(*id)
+                        .map(|t| format!("\"{}\":{t}", serde_json_like::escape(id)))
+                })
+                .collect()
+        };
+        let states_parts: Vec<String> = {
+            let mut ids: Vec<&String> = last_states.keys().collect();
+            ids.sort();
+            ids.iter()
+                .map(|id| {
+                    format!(
+                        "\"{}\":{}",
+                        serde_json_like::escape(id),
+                        serde_json_like::stringify(&last_states[*id])
+                    )
+                })
+                .collect()
+        };
+        let mut snap = Event {
+            ts: now_ms(),
+            from_id: "协调器".into(),
+            to_id: "协调器".into(),
+            event_type: SNAPSHOT_TYPE.into(),
+            payload_json: format!(
+                "{{\"trusts\":{{{}}},\"states\":{{{}}}}}",
+                trusts_parts.join(","),
+                states_parts.join(",")
+            ),
+            round_no: round,
+            level: 0,
+            hmac_hex: String::new(),
+        };
+        snap.hmac_hex = sign_event(&cfg.shared_secret, &snap);
+        let snap_line = format!(
+            "{{\"ts\":{},\"from\":\"{}\",\"to\":\"{}\",\"type\":\"{}\",\"round\":{},\"level\":{},\"hmac\":\"{}\",\"payload\":{}}}\n",
+            snap.ts,
+            serde_json_like::escape(&snap.from_id),
+            serde_json_like::escape(&snap.to_id),
+            serde_json_like::escape(&snap.event_type),
+            snap.round_no,
+            snap.level,
+            snap.hmac_hex,
+            snap.payload_json
+        );
+        wal.write_all(snap_line.as_bytes())
+            .map_err(|e| format!("WAL 快照写入失败: {e}"))?;
         all_events.extend(new_events);
+        all_events.push(snap);
+        wal.sync_all().map_err(|e| format!("WAL sync 失败: {e}"))?;
     }
     // 实例退场
     drop(procs);
-    // 信任聚合（对齐 trust_aggregator.snapshot：每实例最后轮 trust）
+    Ok(aggregate_report(
+        cfg,
+        specs_derived,
+        rounds,
+        all_events,
+        acks,
+        last_states,
+        round_outcomes,
+        gossip_sent,
+        watermarks,
+        global_seq,
+    ))
+}
+
+/// 信任聚合 + 健康评分 + gossip 对账 + 报告组装
+#[allow(clippy::too_many_arguments)] // 聚合收口：各状态均为必需，不为凑参数上限重构
+fn aggregate_report(
+    cfg: &SwarmConfig,
+    specs: Vec<InstanceSpec>,
+    rounds: u64,
+    events: Vec<Event>,
+    acks: HashSet<String>,
+    last_states: HashMap<String, serde_json_like::Value>,
+    round_outcomes: HashMap<String, Vec<Option<bool>>>,
+    gossip_sent: HashMap<String, usize>,
+    watermarks: HashMap<String, u64>,
+    global_seq: u64,
+) -> SwarmReport {    // G3a 健康评分：从轮次终态序列统计（在线窗口口径）
+    // G3c：gossip 覆盖率接入 integrity（对账基准 = 最大实收数）
+    let weights = HealthWeights::default();
+    let gossip_base = gossip_sent.values().copied().max().unwrap_or(0);
+    let mut health: HealthReport = HashMap::new();
+    for spec in &specs {
+        let outcomes = round_outcomes.get(&spec.id).cloned().unwrap_or_default();
+        if outcomes.is_empty() {
+            continue;
+        }
+        let coverage = if gossip_base == 0 {
+            1.0
+        } else {
+            match gossip_sent.get(&spec.id) {
+                // gossip 目标：按实收/基准覆盖降级
+                Some(c) => (*c as f64 / gossip_base as f64).min(1.0),
+                // G5 修正：无键 = 非 gossip 目标（纯源/无入边），无缺收语义 → 1.0。
+                // （此前误判 coverage=0 → 纯源实例 integrity 归零、score 恒 0.8，
+                //   由 G5 kill 容错调试首度暴露——跨特性组合场景测试缺口）
+                None => 1.0,
+            }
+        };
+        let h = score_instance(&outcomes, 0, 1, coverage, &weights);
+        health.insert(spec.id.clone(), h);
+    }
     let mut ts: Vec<f64> = Vec::new();
-    for spec in &cfg.instances {
+    for spec in &specs {
         if let Some(st) = last_states.get(&spec.id) {
             if let Some(t) = st.get("trust").and_then(|x| x.as_f64()) {
                 ts.push(t.clamp(0.0, 1.0));
@@ -506,16 +935,33 @@ pub fn run_swarm(
     } else {
         0.0
     };
-    Ok(SwarmReport {
+    // G3b gossip 对账：全部 gossip 目标实收数相等 = 投递覆盖一致
+    // （单机=结构覆盖断言；跨机场景防丢消息）。空 = gossip 未启用 → true。
+    let gossip_consistent = {
+        let mut counts: Vec<usize> = gossip_sent.values().copied().collect();
+        counts.sort_unstable();
+        counts.first() == counts.last()
+    };
+    SwarmReport {
         rounds,
-        events: all_events,
+        events,
         acks,
         t_avg,
         t_min,
         t_variance,
         t_alignment,
         final_states: last_states,
-    })
+        health,
+        gossip_received: gossip_sent,
+        gossip_consistent,
+        topology: cfg.topology.clone(),
+        roles: specs
+            .iter()
+            .map(|s| (s.id.clone(), s.role.clone()))
+            .collect(),
+        watermarks,
+        global_seq,
+    }
 }
 
 /// 蜂群报告 → JSON（Python 侧消费/对照）
@@ -534,6 +980,77 @@ pub fn report_json(rep: &SwarmReport) -> String {
     out.push('}');
     out.push_str(&format!(",\"events\":{}", rep.events.len()));
     out.push_str(&format!(",\"acks\":{}", rep.acks.len()));
+    // G3a 健康评分（四因子，公式与权重见 health.rs）
+    out.push_str(",\"health\":{");
+    let mut hids: Vec<&String> = rep.health.keys().collect();
+    hids.sort();
+    for (i, id) in hids.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let h = &rep.health[*id];
+        out.push_str(&format!(
+            "\"{}\":{{\"score\":{:.6},\"success_rate\":{:.6},\"uptime_rate\":{:.6},\"threat_rate\":{:.6},\"integrity_rate\":{:.6}}}",
+            serde_json_like::escape(id),
+            h.score,
+            h.success_rate,
+            h.uptime_rate,
+            h.threat_rate,
+            h.integrity_rate
+        ));
+    }
+    out.push('}');
+    // G3b gossip 水位与对账
+    out.push_str(",\"gossip\":{");
+    let mut gids: Vec<&String> = rep.gossip_received.keys().collect();
+    gids.sort();
+    for (i, id) in gids.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "\"{}\":{}",
+            serde_json_like::escape(id),
+            rep.gossip_received[*id]
+        ));
+    }
+    out.push('}');
+    out.push_str(&format!(",\"gossip_consistent\":{}", rep.gossip_consistent));
+    // G4b 消费水位与全局 seq
+    out.push_str(",\"watermarks\":{");
+    let mut wids: Vec<&String> = rep.watermarks.keys().collect();
+    wids.sort();
+    for (i, id) in wids.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "\"{}\":{}",
+            serde_json_like::escape(id),
+            rep.watermarks[*id]
+        ));
+    }
+    out.push('}');
+    out.push_str(&format!(",\"global_seq\":{}", rep.global_seq));
+    // G4a 生效拓扑与各实例角色
+    out.push_str(&format!(
+        ",\"topology\":\"{}\"",
+        serde_json_like::escape(&rep.topology)
+    ));
+    out.push_str(",\"roles\":{");
+    let mut rids: Vec<&String> = rep.roles.keys().collect();
+    rids.sort();
+    for (i, id) in rids.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "\"{}\":\"{}\"",
+            serde_json_like::escape(id),
+            serde_json_like::escape(&rep.roles[*id])
+        ));
+    }
+    out.push('}');
     out.push_str(",\"final_states\":{");
     let mut ids: Vec<&String> = rep.final_states.keys().collect();
     ids.sort();

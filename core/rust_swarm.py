@@ -25,10 +25,14 @@ DEFAULT_SECRET = "蜂群默认密钥"
 
 
 def make_swarm_config(instances: List[Dict], routes: Optional[List[Dict]] = None,
-                      rounds: int = 1, shared_secret: str = DEFAULT_SECRET) -> Dict:
+                      rounds: int = 1, shared_secret: str = DEFAULT_SECRET,
+                      topology: str = "") -> Dict:
     """instances: [{"id","role","trust","symbols"}]；routes: [{"from","event_type","to","payload","level"}]
-    payload 中 "@trust" 占位符在运行时替换为源实例终态信任值。"""
+    payload 中 "@trust" 占位符在运行时替换为源实例终态信任值。
+    topology: "" = 未指定（角色保持用户声明）；"mesh"/"hierarchical"/"centralized"
+    指定后角色由拓扑推导（首实例为 queen/coordinator，其余 worker）——G4a。"""
     return {"algo": ALGO, "shared_secret": shared_secret, "rounds": max(1, int(rounds)),
+            "topology": topology,
             "instances": [{"id": i["id"], "role": i.get("role", "worker"),
                            "trust": float(i.get("trust", 0.0)),
                            "symbols": i.get("symbols", {})} for i in instances],
@@ -70,7 +74,8 @@ def run_swarm(project_dir: str, config: Dict, wal_path: str = "events.jsonl",
 
 def verify_wal_signatures(wal_path: str, shared_secret: str) -> Dict:
     """WAL 逐条验签（Python hmac 独立实现——交叉验证 Rust 手写 SHA256）。
-    签名串：type|from|to|round|ts|payload（与 Rust swarm.rs 约定一致）。"""
+    签名串：type|from|to|round|ts|payload（与 Rust swarm.rs 约定一致）。
+    B1：轮末快照行（type=__snapshot__）同样验签（防篡改），但不计入事件 total。"""
     ok = bad = 0
     with open(wal_path, encoding="utf-8") as f:
         for line in f:
@@ -86,10 +91,10 @@ def verify_wal_signatures(wal_path: str, shared_secret: str) -> Dict:
                                          rec["round"], rec["ts"], raw_payload)
             expect = _hmac.new(shared_secret.encode(), msg.encode(),
                                hashlib.sha256).hexdigest()
-            if _hmac.compare_digest(expect, rec["hmac"]):
-                ok += 1
-            else:
+            if not _hmac.compare_digest(expect, rec["hmac"]):
                 bad += 1
+            elif rec.get("type") != "__snapshot__":
+                ok += 1  # 快照行验签但不计入事件 total（保持事件计数口径）
     return {"total": ok + bad, "verified": ok, "bad": bad,
             "all_valid": bad == 0}
 
@@ -105,3 +110,42 @@ def aggregate_trust_python(trust_values: List[float]) -> Dict:
     var = sum((t - avg) ** 2 for t in ts) / n
     align = 1.0 - var / avg if avg > 0 else 0.0
     return {"T_avg": avg, "T_min": min(ts), "T_variance": var, "T_alignment": align}
+
+
+DEFAULT_HEALTH_WEIGHTS = {"success": 0.4, "uptime": 0.2, "threat": 0.2,
+                          "integrity": 0.2}
+
+
+def aggregate_health_python(round_outcomes: Dict[str, list],
+                            verify_fail: Optional[Dict[str, int]] = None,
+                            total_events: Optional[Dict[str, int]] = None,
+                            weights: Optional[Dict[str, float]] = None,
+                            gossip_coverage: Optional[Dict[str, float]] = None) -> Dict:
+    """实例健康四因子 Python 参照（B3 甲案 · 与 Rust health.rs score_instance 同公式）：
+    score = W.success×成功轮占比 + W.uptime×参与轮占比 + W.threat×(1−error轮占比)
+            + W.integrity×验签通过率×gossip覆盖率。
+    round_outcomes: {实例id: [True|False|None, ...]} 按轮序（None=缺失轮）。
+    gossip_coverage: {实例id: 实收/对账基准}（G3c；缺省=1.0 无 gossip 场景）。"""
+    w = weights or DEFAULT_HEALTH_WEIGHTS
+    vf = verify_fail or {}
+    te = total_events or {}
+    gc = gossip_coverage or {}
+    out: Dict[str, Dict] = {}
+    for iid, outcomes in round_outcomes.items():
+        total = max(1, len(outcomes))
+        part = [x for x in outcomes if x is not None]
+        participated = len(part)
+        success = sum(1 for x in part if x is True)
+        errors = sum(1 for x in part if x is False)
+        p = max(1, participated)
+        sr = success / total
+        ur = participated / total
+        tr = errors / p
+        t = te.get(iid, 0)
+        cov = min(1.0, max(0.0, gc.get(iid, 1.0)))
+        ir = (1.0 if t == 0 else (t - vf.get(iid, 0)) / t) * cov
+        score = min(1.0, max(0.0, w["success"] * sr + w["uptime"] * ur
+                             + w["threat"] * (1 - tr) + w["integrity"] * ir))
+        out[iid] = {"score": score, "success_rate": sr, "uptime_rate": ur,
+                    "threat_rate": tr, "integrity_rate": ir}
+    return out

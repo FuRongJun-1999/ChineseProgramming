@@ -350,6 +350,12 @@ fn cmd_swarm(args: &[String]) -> ExitCode {
         shared_secret: secret,
         instances,
         routes,
+        // G4a 拓扑：缺省 "" = 未指定（角色保持用户声明）
+        topology: cfg_json
+            .get("topology")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
     };
     match swarm::run_swarm(&exe, &cfg, rounds, &wal_path, pbc_path.as_deref()) {
         Ok(rep) => {
