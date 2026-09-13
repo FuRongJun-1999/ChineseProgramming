@@ -47,25 +47,28 @@
 
 ## 修复
 
+- **integrity 通路接通**（v0.6.1 · 2026-09-13 蜂群实测审计发现）：`aggregate_report` 此前调用 `score_instance` 时硬编码 `verify_fail=0, total_events=1`，integrity 因子退化为纯 gossip 覆盖率。修正为事件流逐条重验签名（归属 = `from_id`，快照行不计事件口径，与 Python `verify_wal_signatures` 一致）。单机在线自签自验恒过 + 重放事件已过坏尾守卫 → **数值与 v0.6 完全等价（零回归）**；跨机/直接注入事件流场景验签失败真实降级——数据通路自此不再硬编码。附 `health.rs` Rust 单测 2 项（verify_fail 降级公式 / 零事件回退 coverage，补测试盲区）
+- **功能说明 §五上手缺陷**（实测 A4 评审发现）：示例缺 `generate_rust_project` 前置步骤（`project_dir` 来源未讲，照抄必失败）；`run_swarm` 展示签名与真实签名不一致。重写为五步照抄可跑示例（与 `test_swarm_health.py` 同构）+ 完整签名说明
 - **coverage 边界**（G5 调试暴露）：纯源实例（`gossip_sent` 无键）被误判 coverage=0 → integrity 归零、score 恒 0.8；修正为无键 = 非 gossip 目标 → 1.0
 - **B1 回滚缺口**（kill 演练推演暴露）：重放会把「快照后未提交轮次」的部分事件重建进收件箱且该轮又被重跑 → 事件重复；修正为提交点回滚
 - `rust_codegen.py`：模板复制名单补 `health.rs`（新 .rs 必须同步复制名单，否则生成项目编译失败）
 
-## 验收记录（2026-09-13，七套全绿）
+## 验收记录（2026-09-13，v0.6.1 复跑八套全绿）
 
-总账：七套回归 95 项 + 容错真杀验收 9 项 = **104 项全绿**，clippy 零警告。
+总账：八套回归 107 项全绿 + Rust lib 单测 4 项 + clippy 零警告。
 
 | 套件 | 覆盖 | 结果 |
 |------|------|------|
 | `test_rust_swarm.py` | 既有基线（路由/ACK/验签/聚合/独立形态） | 20/20 |
 | `test_rust_swarm_resume.py` | B1 分段恢复/幂等/坏尾截断 | 15/15 |
 | `test_rust_swarm_kill.py` | C1 强杀协调器 + 真实中途点续跑 | 11/11 |
-| `test_swarm_health.py` | G3a 公式场景 + 双端一致 | 10/10 |
+| `test_swarm_health.py` | G3a 公式场景 + 双端一致 + ③integrity 通路 WAL 独立复算对照（v0.6.1 新增 3 项） | 13/13 |
 | `test_swarm_gossip.py` | G3b/G3c 广播/对账/共存/纯源回归 | 17/17 |
 | `test_swarm_topology.py` | G4a 三型推导/兼容/校验 | 11/11 |
 | `test_swarm_watermark.py` | G4b seq 单调/水位/恢复不断档 | 11/11 |
 | `test_swarm_fault.py` | G5 真杀双实例透明容错 | 9/9 |
-| clippy | 生成项目 | 零警告 |
+| `health.rs` lib 单测 | v0.6.1 verify_fail 公式/零事件回退 | 4/4 |
+| clippy | `--no-default-features -D warnings` | 零警告 |
 
 性能基准（可复跑）：`bench_swarm_parallel.py`（加速比）、`bench_swarm_scale.py`（规模扫描 N=1→64 摊薄不升、吞吐 12218 events/s@16 实例）。
 

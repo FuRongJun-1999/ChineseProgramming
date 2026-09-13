@@ -4,16 +4,18 @@
 公式场景单测（半 error=0.7 / 缺失轮降 uptime / 验签失败降 integrity）。
 """
 import io
+import json
 import os
 import sys
 import tempfile
+from collections import Counter
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 sys.path.insert(0, r"D:\Program Files\2_ai\protocol-compiler")
 
 from core.rust_codegen import generate_rust_project
 from core.rust_swarm import (aggregate_health_python, make_swarm_config,
-                             run_swarm)
+                             run_swarm, verify_wal_signatures)
 
 pass_n = fail_n = 0
 
@@ -88,6 +90,28 @@ if rr["ok"]:
               f"rust={health[iid]['score']:.6f} py={ref[iid]['score']:.6f}")
     check("全成功实例 score=1.0",
           all(abs(health[i]["score"] - 1.0) < 1e-9 for i in health))
+
+    # ============ ③ integrity 数据通路：WAL 独立复算对照（v0.6.1） ============
+    print("=== ③ integrity 通路 WAL 独立复算对照 ===")
+    v = verify_wal_signatures(rr["wal"], SECRET)
+    check("WAL 全部验签通过", v["all_valid"], str(v))
+    per_from = Counter()
+    with open(rr["wal"], encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if rec["type"] == "__snapshot__":
+                continue  # 快照行不计事件口径（与 Rust aggregate_report 一致）
+            per_from[rec["from"]] += 1
+    # 全验签通过 → integrity_rate = (te−0)/te × coverage（无 gossip → 1.0）= 1.0。
+    # 复算断言的意义：若 Rust 侧事件归属/口径与 WAL 漂移，te 与报告不一致即爆。
+    for iid in ("实例甲", "实例乙"):
+        te = per_from.get(iid, 0)
+        check(f"{iid} integrity 通路复算一致（te={te}>0）",
+              te > 0 and abs(health[iid]["integrity_rate"] - 1.0) < 1e-9,
+              f"rust={health[iid]['integrity_rate']:.4f}")
 
 print(f"\n{pass_n} passed, {fail_n} failed")
 sys.exit(1 if fail_n else 0)

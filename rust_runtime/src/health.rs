@@ -85,3 +85,23 @@ pub fn score_instance(
 
 /// 蜂群健康报告：实例 id → 评分
 pub type HealthReport = HashMap<String, InstanceHealth>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_fail_degrades_integrity() {
+        let w = HealthWeights::default();
+        let h = score_instance(&[Some(true), Some(true)], 3, 12, 1.0, &w);
+        assert!((h.integrity_rate - 0.75).abs() < 1e-9);
+        assert!((h.score - (0.4 + 0.2 + 0.2 + 0.2 * 0.75)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_events_falls_back_to_coverage() {
+        let w = HealthWeights::default();
+        let h = score_instance(&[Some(true)], 0, 0, 0.5, &w);
+        assert!((h.integrity_rate - 0.5).abs() < 1e-9);
+    }
+}

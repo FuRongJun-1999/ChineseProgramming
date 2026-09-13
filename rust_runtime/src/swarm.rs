@@ -888,6 +888,22 @@ fn aggregate_report(
 ) -> SwarmReport {    // G3a 健康评分：从轮次终态序列统计（在线窗口口径）
     // G3c：gossip 覆盖率接入 integrity（对账基准 = 最大实收数）
     let weights = HealthWeights::default();
+    // v0.6.1 完整通路：事件流逐条重验签名，统计每实例相关事件的验签失败
+    // 数/总数（归属 = from_id；快照行不计入事件口径，与 Python verify 一致）。
+    // 单机在线自签自验恒过、重放事件已过坏尾守卫 → verify_fail 恒 0，
+    // integrity 数值与 v0.6 等价（零回归）；跨机/直接注入事件流场景验签
+    // 失败真实降级 integrity——数据通路自此接通，不再硬编码 (0, 1)。
+    let mut verify_fail: HashMap<String, usize> = HashMap::new();
+    let mut event_total: HashMap<String, usize> = HashMap::new();
+    for ev in &events {
+        if ev.event_type == SNAPSHOT_TYPE {
+            continue;
+        }
+        *event_total.entry(ev.from_id.clone()).or_insert(0) += 1;
+        if sign_event(&cfg.shared_secret, ev) != ev.hmac_hex {
+            *verify_fail.entry(ev.from_id.clone()).or_insert(0) += 1;
+        }
+    }
     let gossip_base = gossip_sent.values().copied().max().unwrap_or(0);
     let mut health: HealthReport = HashMap::new();
     for spec in &specs {
@@ -907,7 +923,13 @@ fn aggregate_report(
                 None => 1.0,
             }
         };
-        let h = score_instance(&outcomes, 0, 1, coverage, &weights);
+        let h = score_instance(
+            &outcomes,
+            verify_fail.get(&spec.id).copied().unwrap_or(0),
+            event_total.get(&spec.id).copied().unwrap_or(0),
+            coverage,
+            &weights,
+        );
         health.insert(spec.id.clone(), h);
     }
     let mut ts: Vec<f64> = Vec::new();
