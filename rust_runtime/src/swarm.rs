@@ -60,6 +60,8 @@ pub struct SwarmConfig {
     /// "mesh" = 全 peer；"hierarchical" = 首实例 queen 其余 worker；
     /// "centralized" = 首实例 coordinator 其余 worker（对照 A3 ruflo determineRole）
     pub topology: String,
+    /// G-R2 条件空间卡（None = 未声明，向后兼容）
+    pub condition_space: Option<ConditionSpace>,
 }
 
 /// G4a 角色推导（对照 ruflo topology-manager.ts:311-330）。
@@ -70,8 +72,18 @@ pub fn derive_role(topology: &str, index: usize, requested: &str) -> Result<Stri
         "mesh" => Ok("peer".to_string()),
         "hierarchical" => Ok(if index == 0 { "queen" } else { "worker" }.to_string()),
         "centralized" => Ok(if index == 0 { "coordinator" } else { "worker" }.to_string()),
+        // G-R3 protocol 拓扑（§3.9 四角色）：primary 执行 / verifier 逐位复算 /
+        // arbiter 分歧终裁（单机下由协调器承担，此处显式角色位）/ recorder 记录
+        "protocol" => Ok(match index {
+            0 => "primary",
+            1 => "verifier",
+            2 => "arbiter",
+            3 => "recorder",
+            _ => "worker",
+        }
+        .to_string()),
         other => Err(format!(
-            "未知拓扑 {other}（支持 mesh/hierarchical/centralized 或缺省）"
+            "未知拓扑 {other}（支持 mesh/hierarchical/centralized/protocol 或缺省）"
         )),
     }
 }
@@ -102,16 +114,56 @@ pub struct SwarmReport {
     pub gossip_consistent: bool,
     /// G4a：生效拓扑（"" = 未指定）
     pub topology: String,
+    /// G-R2 条件空间卡（None = 未声明，向后兼容）
+    pub condition_space: Option<ConditionSpace>,
     /// G4a：实例角色表（拓扑推导后）
     pub roles: HashMap<String, String>,
     /// G4b：实例消费水位（最后 ACK 的收件箱消息全局 seq）
     pub watermarks: HashMap<String, u64>,
     /// G4b：全局已分配消息 seq
     pub global_seq: u64,
+    /// G-R2：生效条件空间 space_id（None = 未声明）
+    pub condition_space_id: Option<String>,
+    /// G-R3：verifier 逐位复算统计（已复核轮数 / 不一致数）
+    pub recalc_checked: u64,
+    pub recalc_mismatches: u64,
 }
 
 /// gossip 广播保留目标名：Route.to_id = GOSSIP_TARGET 时 fan-out 至除源外全部实例
 pub const GOSSIP_TARGET: &str = "*";
+
+/// G-R2 条件空间卡（§0.0.5 条件论 / §3.1.2 / 第三章声明格式）。
+/// 四要素缺一不可——缺失即拒绝运行（负路由：不满足生效条件不执行）。
+#[derive(Debug, Clone)]
+pub struct ConditionSpace {
+    pub space_id: String,
+    pub observation_position: String,
+    pub observation_tool: String,
+    pub time_window: String,
+    pub existence_constraint: String,
+}
+
+/// 校验并提取可选条件空间卡（cfg_json["condition_space"]）。
+/// 返回 None = 未声明（向后兼容）；声明但四要素任一缺失/为空 → Err。
+pub fn validate_condition_space(
+    raw: Option<&serde_json_like::Value>,
+) -> Result<Option<ConditionSpace>, String> {
+    let Some(cs) = raw else { return Ok(None) };
+    let field = |name: &str| -> Result<String, String> {
+        cs.get(name)
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("条件空间卡字段 {name} 缺失或为空（四要素缺一不可，§3.1.2）"))
+    };
+    Ok(Some(ConditionSpace {
+        space_id: field("space_id")?,
+        observation_position: field("observation_position")?,
+        observation_tool: field("observation_tool")?,
+        time_window: field("time_window")?,
+        existence_constraint: field("existence_constraint")?,
+    }))
+}
 
 /// G4b 收件箱：轮次 → 目标实例 → 来源 → (载荷, 投递时全局 seq)
 type Inboxes = HashMap<u64, HashMap<String, HashMap<String, (String, u64)>>>;
@@ -354,6 +406,24 @@ struct WalReplay {
 
 /// 重放 WAL 重建状态（对照 langgraph 恢复语义：重建后走正常循环，无特殊路径）。
 /// 完整性守卫：任何行 parse 失败或验签失败 → 停在该行（截断点），其前的行可信。
+/// 单行 WAL → (Event, 原始 payload 字符串)；结构残缺返回 None（坏尾截断点）。
+fn parse_event_line(line: &str) -> Option<(Event, String)> {
+    let raw_payload = slice_raw_payload(line)?;
+    let v = serde_json_like::parse(line).ok()?;
+    let get_s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let ev = Event {
+        ts: v.get("ts").and_then(|x| x.as_f64()).unwrap_or(0.0) as u64,
+        from_id: get_s("from"),
+        to_id: get_s("to"),
+        event_type: get_s("type"),
+        payload_json: raw_payload.clone(),
+        round_no: v.get("round").and_then(|x| x.as_f64()).unwrap_or(0.0) as u64,
+        level: v.get("level").and_then(|x| x.as_f64()).unwrap_or(0.0) as u8,
+        hmac_hex: get_s("hmac"),
+    };
+    Some((ev, raw_payload))
+}
+
 fn replay_wal(wal_path: &str, secret: &str) -> Result<WalReplay, String> {
     let mut rp = WalReplay {
         completed: None,
@@ -369,39 +439,46 @@ fn replay_wal(wal_path: &str, secret: &str) -> Result<WalReplay, String> {
         Ok(r) => r,
         Err(_) => return Ok(rp), // 无 WAL = 首跑
     };
-    for line in raw.lines() {
+    // 第一遍：提交点 = 最后一个通过 HMAC 验签的快照行。
+    // v0.6.1 修复：旧逻辑在事件行处做「超前轮截断」，而快照行 round 恒为
+    // completed+1 → 快照被误伤截断，completed 永远停在 1，≥2 轮重入恒触发
+    // 整段确定性重跑而非幂等聚合（重跑结果逐位一致，故 v0.6 全部测试未暴露）。
+    // 快照 = 整轮持久化承诺：其前行（含快照与散事件）全部有效，其后散事件
+    // （kill 落在快照写入前）按 B1 回滚——顺序流前缀性下只有「先扫提交点、
+    // 再重建前缀」两遍扫描才正确，事件行自身无法预判后续是否有快照。
+    let mut commit_idx: Option<usize> = None;
+    for (idx, line) in raw.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let Some(raw_payload) = slice_raw_payload(line) else {
-            break; // 半行（崩溃残留）→ 截断点
+        let Some((ev, _)) = parse_event_line(line) else {
+            break; // 半行（崩溃残留）→ 提交点搜索止于此
         };
-        let Ok(v) = serde_json_like::parse(line) else {
-            break;
+        if sign_event(secret, &ev) != ev.hmac_hex {
+            break; // 尾部篡改/残缺 → 止于此
+        }
+        if ev.event_type == SNAPSHOT_TYPE {
+            commit_idx = Some(idx);
+        }
+    }
+    let Some(commit_idx) = commit_idx else {
+        return Ok(rp); // 无合法快照 = 零提交 → 全回滚（B1）
+    };
+    // 第二遍：只重建提交点前缀（含快照行与其前散事件）
+    for (idx, line) in raw.lines().enumerate() {
+        if idx > commit_idx {
+            break; // 未提交尾部散事件 → 回滚截断（B1 重跑重做）
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((ev, raw_payload)) = parse_event_line(line) else {
+            break; // 理论不可达（第一遍已验），双检无害
         };
-        let get_s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-        let ev = Event {
-            ts: v.get("ts").and_then(|x| x.as_f64()).unwrap_or(0.0) as u64,
-            from_id: get_s("from"),
-            to_id: get_s("to"),
-            event_type: get_s("type"),
-            payload_json: raw_payload.clone(),
-            round_no: v.get("round").and_then(|x| x.as_f64()).unwrap_or(0.0) as u64,
-            level: v.get("level").and_then(|x| x.as_f64()).unwrap_or(0.0) as u8,
-            hmac_hex: get_s("hmac"),
-        };
-        // HMAC 完整性守卫：尾部篡改/残缺即截断
         if sign_event(secret, &ev) != ev.hmac_hex {
             break;
-        }
-        // 快照提交点语义（B1 回滚规则）：快照轮之后的轮次未获持久化承诺，
-        // 整轮回滚重跑——WAL 是顺序日志，第一个超前轮的行即截断点（保持前缀性）。
-        // 这防止「kill 落在事件已写、快照未写之间」时重放+重跑造成事件重复。
-        if let Some(c) = rp.completed {
-            if ev.round_no > c {
-                break;
-            }
         }
         if ev.event_type == SNAPSHOT_TYPE {
             // 快照行：重建信任水位与终态；payload = {"trusts":{..},"states":{..}}
@@ -567,6 +644,20 @@ pub fn run_swarm(
     let mut watermarks: HashMap<String, u64> = HashMap::new();
     // G5：死亡实例集合（重试仍失败 → 退场，蜂群继续）
     let mut dead: HashSet<String> = HashSet::new();
+    // G-R1 反思触发器状态（§5.4 蜂群版触发条件的跨轮记账）
+    let mut reflect_error_streak: u32 = 0; // 连续含 error 终态的轮数
+    let mut reflect_t_avg_prev: Option<f64> = None; // 上一轮 T_avg
+    let mut reflect_t_avg_down: u32 = 0; // T_avg 连续下降轮数
+    let mut reflect_dead_prev: usize = 0; // 上一轮 dead 数（场景变化触发）
+    // 维生权限边界（荣 2026-09-13 裁定）：维生系统只面对重大分歧/错误介入，
+    // 默认作为安全服务端——修正信号仅记录+透出（P2 观察级），不自动改路由；
+    // P0/P1 介入留待真实重大分歧场景，且不可被外部输入覆盖（§3.16）。
+    // G-R3 protocol 拓扑：verifier 子进程重放 primary 输入逐位复算终态。
+    let protocol_mode = cfg.topology == "protocol";
+    let primary_id = specs_derived.first().map(|s| s.id.clone()).unwrap_or_default();
+    let verifier_id = specs_derived.get(1).map(|s| s.id.clone()).unwrap_or_default();
+    let mut recalc_checked: u64 = 0;
+    let mut recalc_mismatches: u64 = 0;
 
     if replay.completed.is_some() && start_round > rounds {
         // 目标轮数已全部持久化完成：不重启实例直接聚合（恢复幂等口径）。
@@ -582,6 +673,8 @@ pub fn run_swarm(
             gossip_sent,
             watermarks,
             global_seq,
+            recalc_checked,
+            recalc_mismatches,
         ));
     }
 
@@ -613,6 +706,24 @@ pub fn run_swarm(
         // 本轮各实例收到的消息（上一轮路由产出）
         let round_inboxes = inboxes.remove(&round).unwrap_or_default();
         let mut new_events: Vec<Event> = Vec::new();
+        let mut error_instances: Vec<String> = Vec::new(); // G-R1：本轮 error 终态实例
+        let mut primary_state_str: Option<String> = None; // G-R3：primary 终态归一基准
+        // G-R3：verifier 本轮改为重放 primary 输入（复算），自身收件箱顺延一轮不丢失
+        let primary_inbox = if protocol_mode {
+            round_inboxes.get(&primary_id).cloned().unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        if protocol_mode {
+            if let Some(own) = round_inboxes.get(&verifier_id) {
+                if !own.is_empty() {
+                    let slot = inboxes.entry(round + 1).or_default().entry(verifier_id.clone()).or_default();
+                    for (from, pv) in own {
+                        slot.insert(from.clone(), pv.clone());
+                    }
+                }
+            }
+        }
         // —— B2 超步（BSP compute 阶段）：轮内实例并行执行 ——
         // 安全性论证：收件箱只来自上一轮路由，轮内实例互不依赖；
         // 一实例一线程一管道（&mut 独占借用），无共享可变状态。
@@ -627,10 +738,16 @@ pub fn run_swarm(
                         if dead.contains(&p.spec.id) {
                             return None;
                         }
-                        let inbox_raw = round_inboxes
-                            .get(&p.spec.id)
-                            .cloned()
-                            .unwrap_or_default();
+                        let is_verifier =
+                            protocol_mode && p.spec.id == verifier_id && !primary_id.is_empty();
+                        let inbox_raw = if is_verifier {
+                            primary_inbox.clone()
+                        } else {
+                            round_inboxes
+                                .get(&p.spec.id)
+                                .cloned()
+                                .unwrap_or_default()
+                        };
                         let has_inbox = !inbox_raw.is_empty();
                         let inbox: HashMap<String, String> = inbox_raw
                             .iter()
@@ -704,10 +821,53 @@ pub fn run_swarm(
             }
             last_states.insert(p.spec.id.clone(), st.clone());
             // G3a：记录本轮终态（error 终态对象含 "error" 键 → Some(false)）
+            let has_error = st.get("error").is_some();
             round_outcomes
                 .entry(p.spec.id.clone())
                 .or_default()
-                .push(Some(!st.get("error").is_some()));
+                .push(Some(!has_error));
+            // G-R1：本轮 error 终态实例登记（触发器用）
+            if has_error {
+                error_instances.push(p.spec.id.clone());
+            }
+            // G-R3：verifier 逐位复算 primary 终态（真实子代理执行——verifier
+            // 子进程重放 primary 的本轮输入，确定性 VM 下同输入必同终态）。
+            let is_primary = protocol_mode && p.spec.id == primary_id;
+            let is_verifier = protocol_mode && p.spec.id == verifier_id;
+            if is_primary {
+                primary_state_str = Some(serde_json_like::stringify(&st));
+            }
+            if is_verifier {
+                if let Some(ps) = &primary_state_str {
+                    recalc_checked += 1;
+                    let vs = serde_json_like::stringify(&st);
+                    if vs != *ps {
+                        recalc_mismatches += 1;
+                        // 复算不一致 = 重大分歧（P1 响应级，维生边界内）：
+                        // 修正信号 level=1 记录+透出，终态仍以 primary 为准（verifier 仅复核）
+                        eprintln!(
+                            "G-R3 复算不一致：verifier 轮 {} 终态与 primary 不符（P1）",
+                            round
+                        );
+                        let mut sig = Event {
+                            ts: now_ms(),
+                            from_id: "协调器".into(),
+                            to_id: "协调器".into(),
+                            event_type: "修正信号".into(),
+                            payload_json: format!(
+                                "{{\"round\":{},\"级别\":\"P1\",\"类型\":\"复算不一致\",\"verifier\":\"{}\"}}",
+                                round,
+                                serde_json_like::escape(&p.spec.id)
+                            ),
+                            round_no: round,
+                            level: 1,
+                            hmac_hex: String::new(),
+                        };
+                        sig.hmac_hex = sign_event(&cfg.shared_secret, &sig);
+                        new_events.push(sig);
+                    }
+                }
+            }
             // 信任提交（防操纵：0-1 夹取；同轮同实例由聚合器去重）。
             // error 终态无 trust 字段 → 沿用上一轮值（实例故障不推平信任曲线）
             let prev_t = last_trust
@@ -798,6 +958,79 @@ pub fn run_swarm(
                 .map_err(|e| format!("WAL 写入失败: {e}"))?;
         }
         wal.flush().map_err(|e| format!("WAL flush 失败: {e}"))?;
+        // G-R1 反思触发器（§5.4 蜂群版）：任一条件命中 → 产出修正信号事件。
+        // 维生边界：修正信号仅记录+透出（P2 观察级），不自动改路由（见函数头裁定注）。
+        let mut reflect_reasons: Vec<String> = Vec::new();
+        if round % 100 == 0 {
+            reflect_reasons.push("定期方向性自检（每100轮，§3.10步骤8）".into());
+        }
+        if !error_instances.is_empty() {
+            reflect_error_streak += 1;
+            if reflect_error_streak >= 2 {
+                reflect_reasons.push(format!(
+                    "error 终态连续 {} 轮（实例：{}）",
+                    reflect_error_streak,
+                    error_instances.join("、")
+                ));
+            }
+        } else {
+            reflect_error_streak = 0;
+        }
+        // T_avg 即时均值（趋势触发用；权威聚合在轮末 aggregate_report）
+        let t_now: f64 = if last_trust.is_empty() {
+            0.0
+        } else {
+            last_trust.values().sum::<f64>() / last_trust.len() as f64
+        };
+        if let Some(prev) = reflect_t_avg_prev {
+            if t_now < prev - 1e-9 {
+                reflect_t_avg_down += 1;
+                if reflect_t_avg_down >= 3 {
+                    reflect_reasons.push(format!("T_avg 连续 {} 轮下降", reflect_t_avg_down));
+                }
+            } else {
+                reflect_t_avg_down = 0;
+            }
+        }
+        reflect_t_avg_prev = Some(t_now);
+        if dead.len() != reflect_dead_prev {
+            reflect_reasons
+                .push(format!("实例退场场景变化（dead {}→{}）", reflect_dead_prev, dead.len()));
+            reflect_dead_prev = dead.len();
+        }
+        if !reflect_reasons.is_empty() {
+            let sig_payload = serde_json_like::stringify(&serde_json_like::Value::List(
+                reflect_reasons
+                    .iter()
+                    .map(|r| serde_json_like::Value::Str(r.clone()))
+                    .collect(),
+            ));
+            let mut sig = Event {
+                ts: now_ms(),
+                from_id: "协调器".into(),
+                to_id: "协调器".into(),
+                event_type: "修正信号".into(),
+                payload_json: sig_payload,
+                round_no: round,
+                level: 2, // P2 观察级（维生边界：仅记录+透出）
+                hmac_hex: String::new(),
+            };
+            sig.hmac_hex = sign_event(&cfg.shared_secret, &sig);
+            let sig_line = format!(
+                "{{\"ts\":{},\"from\":\"{}\",\"to\":\"{}\",\"type\":\"{}\",\"round\":{},\"level\":{},\"hmac\":\"{}\",\"payload\":{}}}\n",
+                sig.ts,
+                serde_json_like::escape(&sig.from_id),
+                serde_json_like::escape(&sig.to_id),
+                serde_json_like::escape(&sig.event_type),
+                sig.round_no,
+                sig.level,
+                sig.hmac_hex,
+                sig.payload_json
+            );
+            wal.write_all(sig_line.as_bytes())
+                .map_err(|e| format!("修正信号写入失败: {e}"))?;
+            all_events.push(sig);
+        }
         // 轮末快照行：复用事件行格式与签名约定（Python verify 按类型跳过计数仍验签）。
         // payload = {"trusts":{...},"states":{...}}——恢复时重建信任水位与终态。
         let trusts_parts: Vec<String> = {
@@ -824,15 +1057,21 @@ pub fn run_swarm(
                 })
                 .collect()
         };
+        // G-R2：条件空间 space_id 随快照持久（切换日志不可遗忘的载体；无卡则省字段）
+        let cs_field = match &cfg.condition_space {
+            Some(cs) => format!(",\"cs\":\"{}\"", serde_json_like::escape(&cs.space_id)),
+            None => String::new(),
+        };
         let mut snap = Event {
             ts: now_ms(),
             from_id: "协调器".into(),
             to_id: "协调器".into(),
             event_type: SNAPSHOT_TYPE.into(),
             payload_json: format!(
-                "{{\"trusts\":{{{}}},\"states\":{{{}}}}}",
+                "{{\"trusts\":{{{}}},\"states\":{{{}}}{}}}",
                 trusts_parts.join(","),
-                states_parts.join(",")
+                states_parts.join(","),
+                cs_field
             ),
             round_no: round,
             level: 0,
@@ -869,6 +1108,8 @@ pub fn run_swarm(
         gossip_sent,
         watermarks,
         global_seq,
+        recalc_checked,
+        recalc_mismatches,
     ))
 }
 
@@ -885,6 +1126,8 @@ fn aggregate_report(
     gossip_sent: HashMap<String, usize>,
     watermarks: HashMap<String, u64>,
     global_seq: u64,
+    recalc_checked: u64,
+    recalc_mismatches: u64,
 ) -> SwarmReport {    // G3a 健康评分：从轮次终态序列统计（在线窗口口径）
     // G3c：gossip 覆盖率接入 integrity（对账基准 = 最大实收数）
     let weights = HealthWeights::default();
@@ -977,12 +1220,16 @@ fn aggregate_report(
         gossip_received: gossip_sent,
         gossip_consistent,
         topology: cfg.topology.clone(),
+        condition_space: cfg.condition_space.clone(),
+        condition_space_id: cfg.condition_space.as_ref().map(|c| c.space_id.clone()),
         roles: specs
             .iter()
             .map(|s| (s.id.clone(), s.role.clone()))
             .collect(),
         watermarks,
         global_seq,
+        recalc_checked,
+        recalc_mismatches,
     }
 }
 
@@ -1038,6 +1285,18 @@ pub fn report_json(rep: &SwarmReport) -> String {
     }
     out.push('}');
     out.push_str(&format!(",\"gossip_consistent\":{}", rep.gossip_consistent));
+    // G-R2 生效条件空间
+    if let Some(id) = &rep.condition_space_id {
+        out.push_str(&format!(
+            ",\"condition_space\":\"{}\"",
+            serde_json_like::escape(id)
+        ));
+    }
+    // G-R3 复算统计
+    out.push_str(&format!(
+        ",\"recalc\":{{\"checked\":{},\"mismatches\":{}}}",
+        rep.recalc_checked, rep.recalc_mismatches
+    ));
     // G4b 消费水位与全局 seq
     out.push_str(",\"watermarks\":{");
     let mut wids: Vec<&String> = rep.watermarks.keys().collect();

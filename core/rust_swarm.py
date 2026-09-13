@@ -26,19 +26,25 @@ DEFAULT_SECRET = "蜂群默认密钥"
 
 def make_swarm_config(instances: List[Dict], routes: Optional[List[Dict]] = None,
                       rounds: int = 1, shared_secret: str = DEFAULT_SECRET,
-                      topology: str = "") -> Dict:
+                      topology: str = "",
+                      condition_space: Optional[Dict] = None) -> Dict:
     """instances: [{"id","role","trust","symbols"}]；routes: [{"from","event_type","to","payload","level"}]
     payload 中 "@trust" 占位符在运行时替换为源实例终态信任值。
     topology: "" = 未指定（角色保持用户声明）；"mesh"/"hierarchical"/"centralized"
-    指定后角色由拓扑推导（首实例为 queen/coordinator，其余 worker）——G4a。"""
-    return {"algo": ALGO, "shared_secret": shared_secret, "rounds": max(1, int(rounds)),
-            "topology": topology,
-            "instances": [{"id": i["id"], "role": i.get("role", "worker"),
-                           "trust": float(i.get("trust", 0.0)),
-                           "symbols": i.get("symbols", {})} for i in instances],
-            "routes": [{"from": r["from"], "event_type": r.get("event_type", "消息"),
-                        "to": r["to"], "payload": r.get("payload", "null"),
-                        "level": int(r.get("level", 0))} for r in (routes or [])]}
+    指定后角色由拓扑推导（首实例为 queen/coordinator，其余 worker）——G4a。
+    condition_space: G-R2 条件空间卡（§0.0.5 四要素，缺一不可）：
+      {"space_id","observation_position","observation_tool","time_window","existence_constraint"}"""
+    cfg = {"algo": ALGO, "shared_secret": shared_secret, "rounds": max(1, int(rounds)),
+           "topology": topology,
+           "instances": [{"id": i["id"], "role": i.get("role", "worker"),
+                          "trust": float(i.get("trust", 0.0)),
+                          "symbols": i.get("symbols", {})} for i in instances],
+           "routes": [{"from": r["from"], "event_type": r.get("event_type", "消息"),
+                       "to": r["to"], "payload": r.get("payload", "null"),
+                       "level": int(r.get("level", 0))} for r in (routes or [])]}
+    if condition_space is not None:
+        cfg["condition_space"] = condition_space
+    return cfg
 
 
 def run_swarm(project_dir: str, config: Dict, wal_path: str = "events.jsonl",
@@ -49,6 +55,13 @@ def run_swarm(project_dir: str, config: Dict, wal_path: str = "events.jsonl",
     `exe` / `pbc_path` 供独立形态（`cargo build --release --no-default-features`，
     未嵌入字节码）使用：协调器须显式 `--pbc`，并由 Rust 侧转发给实例子进程。
     生成项目形态（默认 `embed`）两者均可省略。
+
+    报告口径契约（消费方必读）：
+    - `watermarks` 是「实例消费到的全局事件版本号 seq」（单调递增），不是消息条数；
+      消息条数语义在 `gossip` 字段（也是计数口径）。
+    - `trust` 聚合值（T_avg/T_min/T_variance/T_alignment）由 Rust 侧以 6 位小数
+      精度呈现——跨实现比对用 1e-6 容差，勿做字符串/1e-9 级严格比较。
+    - `events` 计数包含轮末快照行；事件口径（不含快照）= events − 快照行数。
     """
     cfg_path = os.path.join(project_dir, "swarm.json")
     with open(cfg_path, "w", encoding="utf-8") as f:
@@ -75,8 +88,11 @@ def run_swarm(project_dir: str, config: Dict, wal_path: str = "events.jsonl",
 def verify_wal_signatures(wal_path: str, shared_secret: str) -> Dict:
     """WAL 逐条验签（Python hmac 独立实现——交叉验证 Rust 手写 SHA256）。
     签名串：type|from|to|round|ts|payload（与 Rust swarm.rs 约定一致）。
-    B1：轮末快照行（type=__snapshot__）同样验签（防篡改），但不计入事件 total。"""
+    B1：轮末快照行（type=__snapshot__）同样验签（防篡改），但不计入事件 total。
+    口径契约：total/verified/bad 均为「事件行」口径；快照行验签统计单列于
+    返回值 snapshots={verified,bad}；all_valid = 事件行与快照行全部通过。"""
     ok = bad = 0
+    snap_ok = snap_bad = 0
     with open(wal_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -91,12 +107,20 @@ def verify_wal_signatures(wal_path: str, shared_secret: str) -> Dict:
                                          rec["round"], rec["ts"], raw_payload)
             expect = _hmac.new(shared_secret.encode(), msg.encode(),
                                hashlib.sha256).hexdigest()
-            if not _hmac.compare_digest(expect, rec["hmac"]):
+            valid = _hmac.compare_digest(expect, rec["hmac"])
+            if rec.get("type") == "__snapshot__":
+                # 快照行：验签（防篡改）但单列统计，不混入事件口径
+                if valid:
+                    snap_ok += 1
+                else:
+                    snap_bad += 1
+            elif valid:
+                ok += 1
+            else:
                 bad += 1
-            elif rec.get("type") != "__snapshot__":
-                ok += 1  # 快照行验签但不计入事件 total（保持事件计数口径）
     return {"total": ok + bad, "verified": ok, "bad": bad,
-            "all_valid": bad == 0}
+            "snapshots": {"verified": snap_ok, "bad": snap_bad},
+            "all_valid": bad == 0 and snap_bad == 0}
 
 
 def aggregate_trust_python(trust_values: List[float]) -> Dict:

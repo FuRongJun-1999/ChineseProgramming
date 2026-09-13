@@ -346,6 +346,14 @@ fn cmd_swarm(args: &[String]) -> ExitCode {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "protocol_vm".into());
+    // G-R2 条件空间卡：声明即校验（四要素缺一不可 → 拒绝运行，负路由）
+    let condition_space = match swarm::validate_condition_space(cfg_json.get("condition_space")) {
+        Ok(cs) => cs,
+        Err(e) => {
+            eprintln!("条件空间卡校验失败: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let cfg = swarm::SwarmConfig {
         shared_secret: secret,
         instances,
@@ -356,6 +364,7 @@ fn cmd_swarm(args: &[String]) -> ExitCode {
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string(),
+        condition_space,
     };
     match swarm::run_swarm(&exe, &cfg, rounds, &wal_path, pbc_path.as_deref()) {
         Ok(rep) => {
