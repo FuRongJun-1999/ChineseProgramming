@@ -45,8 +45,14 @@
 - 重试仍失败 → dead 退场（outcomes 记 None、uptime 降、蜂群继续）
 - 端到端验收：运行中强杀 2 个 `--serve` 实例 → 蜂群 rc=0 无感完成，终态与基线逐项一致（透明容错）
 
+## 插件化（v0.6.1 启动 · 蜂群作为多 harness 子代理方案）
+
+- **CLI 内核** `core/swarm_cli.py`：`run`（config→编译→蜂群→报告；同 project+wal 重入=断点续跑/幂等聚合）+ `verify`（WAL HMAC 验签，Python 独立复核）。stdout 恒单行 JSON（机器面）、stderr 人面；config 支持 `source: "@file"` 引用。零新依赖。安全模型三重：确定性 VM 子进程（纯 std 无网络/无文件 I/O）、HMAC 全事件签名+跨实现交叉验签、WAL 留痕+坏尾守卫。端到端测试 `tests/test_swarm_cli.py` 10 断言（含篡改检测/幂等重入/坏 config 诚实报错）。后续：双端插件壳（复用 dsh-memory marketplace 模式）→ 跨机口径
+- 已知边界（诚实记录）：幂等聚合路径报告的 `watermarks` 为空对象（重放不重建水位，v0.6 既有行为非本次引入）——跨机口径设计时一并处理
+
 ## 修复
 
+- **replay_wal 提交点判定缺陷**（v0.6.1 · CLI 内核端到端测试暴露的 v0.6 遗留缺陷）：旧逻辑在事件行处做「超前轮截断」（`round > completed → break`），而快照行 round 恒为 completed+1 → **快照（提交点本身）被误伤截断**，completed 永远停在 1，「已完成≥目标→幂等聚合」对 ≥2 轮永不触发，重入恒触发整段确定性重跑——重跑结果逐位一致（确定性），故 v0.6 全部 18 套测试未暴露。修复：`replay_wal` 改两遍扫描——先定位最后合法快照行（提交点），再重建前缀；其后散事件（kill 落在快照写入前窗口）按 B1 回滚。语义：提交点=最后一个验签通过的快照
 - **integrity 通路接通**（v0.6.1 · 2026-09-13 蜂群实测审计发现）：`aggregate_report` 此前调用 `score_instance` 时硬编码 `verify_fail=0, total_events=1`，integrity 因子退化为纯 gossip 覆盖率。修正为事件流逐条重验签名（归属 = `from_id`，快照行不计事件口径，与 Python `verify_wal_signatures` 一致）。单机在线自签自验恒过 + 重放事件已过坏尾守卫 → **数值与 v0.6 完全等价（零回归）**；跨机/直接注入事件流场景验签失败真实降级——数据通路自此不再硬编码。附 `health.rs` Rust 单测 2 项（verify_fail 降级公式 / 零事件回退 coverage，补测试盲区）
 - **功能说明 §五上手缺陷**（实测 A4 评审发现）：示例缺 `generate_rust_project` 前置步骤（`project_dir` 来源未讲，照抄必失败）；`run_swarm` 展示签名与真实签名不一致。重写为五步照抄可跑示例（与 `test_swarm_health.py` 同构）+ 完整签名说明
 - **coverage 边界**（G5 调试暴露）：纯源实例（`gossip_sent` 无键）被误判 coverage=0 → integrity 归零、score 恒 0.8；修正为无键 = 非 gossip 目标 → 1.0
