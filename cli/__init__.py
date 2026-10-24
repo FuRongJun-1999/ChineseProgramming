@@ -439,7 +439,10 @@ def cmd_rust(args) -> int:
     import json
     import os
     import sys
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    try:
+    sys.stdout.reconfigure(encoding="utf-8")  # #1：不替换对象——pytest 捕获兼容
+except (AttributeError, ValueError):
+    pass
     from core.rust_codegen import build_and_run, generate_rust_project
     source = _read_input(args.input)
     if source is None:

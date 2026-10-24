@@ -12,7 +12,10 @@ import subprocess
 import sys
 import tempfile
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+try:
+    sys.stdout.reconfigure(encoding="utf-8")  # #1：不替换对象——pytest 捕获兼容
+except (AttributeError, ValueError):
+    pass
 sys.path.insert(0, r"D:\Program Files\2_ai\protocol-compiler")
 
 from core.compiler import compile_source
@@ -223,4 +226,5 @@ else:
     check("cargo 不可用 → 跳过独立形态（环境声明）", True)
 
 print(f"\n{pass_n} passed, {fail_n} failed")
-sys.exit(1 if fail_n else 0)
+if __name__ == "__main__":
+    sys.exit(1 if fail_n else 0)

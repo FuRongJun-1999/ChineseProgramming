@@ -1,11 +1,15 @@
+import os
 # -*- coding: utf-8 -*-
 """test_loop_compile.py · 中文循环语法（当…执行）端到端测试（第六阶段第49轮）
 「当 条件 执行 操作」→ AST(LOOP_STMT) → 字节码(条件→JIF跳出→体→JUMP回条件)
 → VM 原生执行（零 Python 运行时）。对齐白箱「编译-循环」单元语义。
 """
 import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.path.insert(0, r'D:\Program Files\2_ai\protocol-compiler')
+try:
+    sys.stdout.reconfigure(encoding="utf-8")  # #1：不替换对象——pytest 捕获兼容
+except (AttributeError, ValueError):
+    pass
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # #3：仓根可移植定位
 from core.compiler import compile_source
 from core.condition_vm import ConditionVM, Opcode
 
@@ -119,4 +123,5 @@ else:
     check('⑧ 条件体内块（then 两条德 0.1×2=0.2）', False, str(r8["errors"])[:40])
 
 print(f'\n=== 中文循环语法（当…执行）测试: {pass_n}/{pass_n + fail_n} 通过 ===')
-sys.exit(0 if fail_n == 0 else 1)
+if __name__ == "__main__":
+    sys.exit(0 if fail_n == 0 else 1)

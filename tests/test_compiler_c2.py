@@ -84,4 +84,5 @@ if r6["ok"]:
           f'trust={state6["trust"]}')
 
 print(f'\n=== C2 中文编译器测试: {pass_n}/{pass_n + fail_n} 通过 ===')
-sys.exit(0 if fail_n == 0 else 1)
+if __name__ == "__main__":
+    sys.exit(0 if fail_n == 0 else 1)

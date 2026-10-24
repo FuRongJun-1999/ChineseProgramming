@@ -13,11 +13,19 @@ import sys
 import tempfile
 import time
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+try:
+    sys.stdout.reconfigure(encoding="utf-8")  # #1：不替换对象——pytest 捕获兼容
+except (AttributeError, ValueError):
+    pass
 sys.path.insert(0, r"D:\Program Files\2_ai\protocol-compiler")
 
 from core.rust_codegen import generate_rust_project
 from core.rust_swarm import make_swarm_config, run_swarm
+
+import shutil as _shutil, pytest as _pytest
+if not _shutil.which("cargo"):
+    _pytest.skip("cargo 不可用（#4：守卫前置——无工具链时跳过而非裸崩）", allow_module_level=True)
+
 
 SOURCE = """问曰：如何验证信任？
 答曰：信任值大于0.7。

@@ -10,7 +10,10 @@ import os
 import sys
 import tempfile
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+try:
+    sys.stdout.reconfigure(encoding="utf-8")  # #1：不替换对象——pytest 捕获兼容
+except (AttributeError, ValueError):
+    pass
 sys.path.insert(0, r"D:\Program Files\2_ai\protocol-compiler")
 
 from core.rust_codegen import generate_rust_project
@@ -70,6 +73,11 @@ check("断言抽取覆盖 health/gossip/watermark",
 # ============ ② 注入破坏：gossip_consistent=False ============
 print("=== ② 注入 gossip 覆盖破坏 ===")
 import copy
+
+import shutil as _shutil, pytest as _pytest
+if not _shutil.which("cargo"):
+    _pytest.skip("cargo 不可用（#4：守卫前置——无工具链时跳过而非裸崩）", allow_module_level=True)
+
 bad = copy.deepcopy(rr["report"])
 bad["gossip_consistent"] = False
 ref2 = reflect(bad, routes=ROUTES)
@@ -118,4 +126,5 @@ check("两跳影响面：甲破 → 乙（一跳）→ 丙（二跳经乙的定�
       str([i["affected"] for i in imp4]))
 
 print(f"\n{pass_n} passed, {fail_n} failed")
-sys.exit(1 if fail_n else 0)
+if __name__ == "__main__":
+    sys.exit(1 if fail_n else 0)

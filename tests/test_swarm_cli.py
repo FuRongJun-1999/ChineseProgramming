@@ -13,7 +13,10 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+try:
+    sys.stdout.reconfigure(encoding="utf-8")  # #1：不替换对象——pytest 捕获兼容
+except (AttributeError, ValueError):
+    pass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 pass_n = fail_n = 0
@@ -128,4 +131,5 @@ check("缺 source 字段 → ok=false + stage=config", code == 1 and
       out3.get("ok") is False and out3.get("stage") == "config", f"code={code}")
 
 print(f"\n{pass_n} passed, {fail_n} failed")
-sys.exit(1 if fail_n else 0)
+if __name__ == "__main__":
+    sys.exit(1 if fail_n else 0)

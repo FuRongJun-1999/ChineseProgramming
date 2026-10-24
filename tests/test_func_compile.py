@@ -1,11 +1,15 @@
+import os
 # -*- coding: utf-8 -*-
 """test_func_compile.py · 中文函数定义/调用/递归（第六阶段第57轮）
 「定义 名（参数）：语句」→ FUNC_DEF → 函数体后置 + CALL/RETURN 调用栈帧
 → VM 原生执行（递归通过 CALL 自身，对齐 P 线 P3 函数+递归语义）。
 """
 import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.path.insert(0, r'D:\Program Files\2_ai\protocol-compiler')
+try:
+    sys.stdout.reconfigure(encoding="utf-8")  # #1：不替换对象——pytest 捕获兼容
+except (AttributeError, ValueError):
+    pass
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # #3：仓根可移植定位
 from core.compiler import compile_source
 from core.condition_vm import ConditionVM, Opcode
 
@@ -123,4 +127,5 @@ else:
     check('⑦ 多参数递归 gcd(48,36)=12', False, str(r7["errors"])[:40])
 
 print(f'\n=== 中文函数（定义/调用/递归）测试: {pass_n}/{pass_n + fail_n} 通过 ===')
-sys.exit(0 if fail_n == 0 else 1)
+if __name__ == "__main__":
+    sys.exit(0 if fail_n == 0 else 1)

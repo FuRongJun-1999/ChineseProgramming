@@ -56,4 +56,5 @@ check('④ .pbc 单步调试', len(tr) > 0 and tr[-1].get("halt") == "halt",
       f'{len(tr)} 步')
 
 print(f'\n=== C4 工具链测试: {pass_n}/{pass_n + fail_n} 通过 ===')
-sys.exit(0 if fail_n == 0 else 1)
+if __name__ == "__main__":
+    sys.exit(0 if fail_n == 0 else 1)

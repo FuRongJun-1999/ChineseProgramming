@@ -99,4 +99,5 @@ state = vm.run(code)
 check('⑧ 比较指令', state["stack"] == [True], str(state["stack"]))
 
 print(f'\n=== 智能论 VM 测试: {pass_n}/{pass_n + fail_n} 通过 ===')
-sys.exit(0 if fail_n == 0 else 1)
+if __name__ == "__main__":
+    sys.exit(0 if fail_n == 0 else 1)

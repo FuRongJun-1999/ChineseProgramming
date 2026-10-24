@@ -10,11 +10,19 @@ import os
 import sys
 import tempfile
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+try:
+    sys.stdout.reconfigure(encoding="utf-8")  # #1：不替换对象——pytest 捕获兼容
+except (AttributeError, ValueError):
+    pass
 sys.path.insert(0, r"D:\Program Files\2_ai\protocol-compiler")
 
 from core.rust_codegen import generate_rust_project
 from core.rust_swarm import make_swarm_config, run_swarm
+
+import shutil as _shutil, pytest as _pytest
+if not _shutil.which("cargo"):
+    _pytest.skip("cargo 不可用（#4：守卫前置——无工具链时跳过而非裸崩）", allow_module_level=True)
+
 
 pass_n = fail_n = 0
 
@@ -107,4 +115,5 @@ if rr["ok"]:
           str(rr["report"]["gossip"]))
 
 print(f"\n{pass_n} passed, {fail_n} failed")
-sys.exit(1 if fail_n else 0)
+if __name__ == "__main__":
+    sys.exit(1 if fail_n else 0)

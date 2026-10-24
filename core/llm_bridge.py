@@ -21,7 +21,9 @@ import hashlib
 from typing import Optional, Dict, List, Callable, Any
 from dataclasses import dataclass, field
 from enum import Enum
-import requests
+# #1：requests 改惰性——测试面收集期不再硬依赖可选依赖
+requests = None
+
 
 from .protocol_prompt import build_system_prompt, get_context_for_task
 
@@ -647,7 +649,7 @@ class LLMBridge:
             payload["response_format"] = {"type": "json_object"}
 
         try:
-            resp = requests.post(
+            resp = _ensure_requests().post(
                 f"{config.base_url}/chat/completions",
                 headers=headers,
                 json=payload,
@@ -705,6 +707,15 @@ class LLMBridge:
 # =============================================================================
 # 便捷工厂函数
 # =============================================================================
+
+def _ensure_requests():
+    """惰性导入 requests（#1）：模块导入期不再硬依赖可选依赖。"""
+    global requests
+    if requests is None:
+        import requests as _r
+        requests = _r
+    return requests
+
 
 def create_default_bridge(spirit_layer: SpiritLayerProxy = None,
                          auto_test: bool = True) -> LLMBridge:

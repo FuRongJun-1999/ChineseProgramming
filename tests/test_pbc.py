@@ -59,4 +59,5 @@ if os.path.isfile(pbc):
     check('④ .pbc 文件加载一致', loaded_norm == code_c, f'len={len(loaded)}')
 
 print(f'\n=== C3 原生编译测试: {pass_n}/{pass_n + fail_n} 通过 ===')
-sys.exit(0 if fail_n == 0 else 1)
+if __name__ == "__main__":
+    sys.exit(0 if fail_n == 0 else 1)
