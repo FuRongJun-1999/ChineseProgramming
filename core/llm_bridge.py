@@ -99,6 +99,8 @@ class LLMTrustMetrics:
     recent_failures: int = 0
     trust_value: float = 0.5  # 协议默认初始信任值
     consecutive_successes: int = 0
+    last_error: str = ""  # 最近一次失败原因（#10：调用点已算出，此前被静默丢弃 ⇒ 不可诊断）
+    error_counts: Dict[str, int] = field(default_factory=dict)  # 失败原因 → 次数
 
     def update_success(self, latency: float):
         self.total_calls += 1
@@ -114,6 +116,10 @@ class LLMTrustMetrics:
         self.total_calls += 1
         self.recent_failures += 1
         self.consecutive_successes = 0
+        # 失败原因留痕（#10：同一惩罚值可能来自「供应商返回空」或「网络异常」，
+        # 只记数则 trust_value 的下降无归因）
+        self.last_error = error or ""
+        self.error_counts[error or ""] = self.error_counts.get(error or "", 0) + 1
         # 失败时信任值下降，连续失败加速
         penalty = 0.03 * (1 + self.recent_failures * 0.5)
         self.trust_value = max(0.0, self.trust_value - penalty)
