@@ -503,8 +503,14 @@ class LLMBridge:
     # 内部方法
     # -------------------------------------------------------------------------
 
+    #: 允许走 LLM 的方法白名单（#9：三个能力入口的实参是死的，此前 method 零引用
+    #  ⇒ 闸面假象为按方法决策；现 fail-closed——未登记方法一律拒绝，加方法只需在此登记）
+    LLM_ENABLED_METHODS = frozenset({"understand", "suggest_verification", "explain_term"})
+
     def _should_proceed(self, method: str) -> bool:
-        """检查是否应该继续（灵魂层允许 + 有可用供应商）"""
+        """检查是否应该继续（方法在白名单内 + 灵魂层允许 + 有可用供应商）"""
+        if method not in self.LLM_ENABLED_METHODS:
+            return False
         if not self.spirit.should_use_llm():
             return False
         if not self._connected:
